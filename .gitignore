@@ -1,0 +1,32 @@
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Keil / MDK generated artifacts
+*.axf
+*.crf
+*.d
+*.dep
+*.htm
+*.iex
+*.lnp
+*.map
+*.o
+*.plg
+*.uvgui*
+
+# CubeIDE generated build outputs
+firmware/current_project/STM32CubeIDE/Debug/
+firmware/baseline_project/STM32CubeIDE/Debug/
+
+# Temp
+*.tmp
+*.bak

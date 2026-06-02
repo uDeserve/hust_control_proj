@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>电机速度实验 CSV 对比</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="page-shell">
+    <aside class="side-panel">
+      <div class="panel-block hero-block">
+        <p class="eyebrow">Motor Control Lab</p>
+        <h1>CSV 对比可视化</h1>
+        <p class="hero-copy">
+          用来对比不同滤波方法、不同参数组合下的速度曲线、目标速度和局部波动。
+        </p>
+      </div>
+
+      <div class="panel-block">
+        <label class="file-picker" for="csvInput" id="dropZone">
+          <span>导入 CSV</span>
+          <small>支持一次选择多个文件，也支持拖拽到这里</small>
+        </label>
+        <input id="csvInput" type="file" accept=".csv,text/csv" multiple />
+        <div class="button-row single-row">
+          <button id="clearAllBtn" class="secondary-btn" type="button">清空数据</button>
+        </div>
+      </div>
+
+      <div class="panel-block">
+        <h2>快速预设</h2>
+        <div class="preset-grid">
+          <button id="presetRawFilteredBtn" class="secondary-btn" type="button">原始 vs 滤波</button>
+          <button id="presetFilteredTargetBtn" class="secondary-btn" type="button">滤波 vs 目标</button>
+          <button id="presetStartupBtn" class="secondary-btn" type="button">启动放大</button>
+          <button id="presetSteadyBtn" class="secondary-btn" type="button">稳态波动</button>
+        </div>
+      </div>
+
+      <div class="panel-block">
+        <h2>坐标设置</h2>
+        <label>
+          <span>X 轴列</span>
+          <select id="xColumnSelect"></select>
+        </label>
+        <label>
+          <span>主 Y 轴列</span>
+          <select id="yColumnSelect"></select>
+        </label>
+        <label>
+          <span>第二 Y 轴列</span>
+          <select id="y2ColumnSelect"></select>
+        </label>
+        <label>
+          <span>额外叠加列</span>
+          <select id="compareColumnSelect"></select>
+        </label>
+      </div>
+
+      <div class="panel-block">
+        <h2>显示选项</h2>
+        <label>
+          <span>图表模式</span>
+          <select id="layoutModeSelect">
+            <option value="overlay">单图堆叠</option>
+            <option value="small-multiples">多图并列</option>
+          </select>
+        </label>
+        <label class="check-row">
+          <input id="normalizeTimeCheckbox" type="checkbox" checked />
+          <span>时间从 0 开始</span>
+        </label>
+        <label class="check-row">
+          <input id="showPointsCheckbox" type="checkbox" />
+          <span>显示采样点</span>
+        </label>
+        <label class="check-row">
+          <input id="showLegendCheckbox" type="checkbox" checked />
+          <span>显示图例</span>
+        </label>
+        <label class="check-row">
+          <input id="showY2Checkbox" type="checkbox" />
+          <span>显示第二 Y 轴</span>
+        </label>
+        <label class="check-row">
+          <input id="groupByColumnCheckbox" type="checkbox" checked />
+          <span>按列名分组着色</span>
+        </label>
+      </div>
+
+      <div class="panel-block">
+        <h2>局部窗口</h2>
+        <label>
+          <span>X 最小值</span>
+          <input id="xMinInput" type="number" step="any" placeholder="自动" />
+        </label>
+        <label>
+          <span>X 最大值</span>
+          <input id="xMaxInput" type="number" step="any" placeholder="自动" />
+        </label>
+        <label>
+          <span>Y 最小值</span>
+          <input id="yMinInput" type="number" step="any" placeholder="自动" />
+        </label>
+        <label>
+          <span>Y 最大值</span>
+          <input id="yMaxInput" type="number" step="any" placeholder="自动" />
+        </label>
+        <div class="button-row">
+          <button id="applyRangeBtn" type="button">应用窗口</button>
+          <button id="resetRangeBtn" class="secondary-btn" type="button">重置窗口</button>
+        </div>
+      </div>
+
+      <div class="panel-block">
+        <h2>数据集</h2>
+        <div id="datasetList" class="dataset-list empty-state">
+          还没有导入 CSV 文件
+        </div>
+      </div>
+
+      <div class="panel-block">
+        <h2>曲线清单</h2>
+        <div id="seriesList" class="series-list empty-state">
+          导入 CSV 后会在这里显示每条曲线
+        </div>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <section class="summary-strip">
+        <div class="metric-card">
+          <span class="metric-label">数据集数量</span>
+          <strong id="datasetCount">0</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">总采样点</span>
+          <strong id="pointCount">0</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">当前主曲线</span>
+          <strong id="currentYLabel">未选择</strong>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">窗口状态</span>
+          <strong id="windowLabel">全局</strong>
+        </div>
+      </section>
+
+      <section class="chart-card">
+        <div class="chart-toolbar">
+          <div>
+            <h2>主图</h2>
+            <p>支持多文件叠加，也支持同一个 CSV 内多列直接对比。</p>
+          </div>
+          <button id="exportPngBtn" type="button">导出 PNG</button>
+        </div>
+        <canvas id="chartCanvas" width="1400" height="760"></canvas>
+        <div id="smallMultiplesGrid" class="small-multiples-grid hidden"></div>
+      </section>
+
+      <section class="chart-card">
+        <div class="chart-toolbar">
+          <div>
+            <h2>统计预览</h2>
+            <p>快速看每条曲线在当前窗口下的均值、峰峰值、标准差。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="statsTable">
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>曲线</th>
+                <th>坐标轴</th>
+                <th>点数</th>
+                <th>均值</th>
+                <th>最小</th>
+                <th>最大</th>
+                <th>峰峰值</th>
+                <th>标准差</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="chart-card">
+        <div class="chart-toolbar">
+          <div>
+            <h2>实验指标对比</h2>
+            <p>面向答辩的整次实验指标，重点看启动速度、稳态误差和稳态抖动。</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="experimentTable">
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>方法</th>
+                <th>参数</th>
+                <th>目标转速</th>
+                <th>上升时间(ms)</th>
+                <th>稳态建立(ms)</th>
+                <th>稳态均值</th>
+                <th>稳态误差</th>
+                <th>稳态标准差</th>
+                <th>稳态峰峰值</th>
+                <th>最大超调</th>
+                <th>总时长(ms)</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

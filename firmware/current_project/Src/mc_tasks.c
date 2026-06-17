@@ -45,17 +45,18 @@ extern UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN Private define */
 /* 现场演示就改这一个参数。
-   1) 滤波方法对比：其他东西都固定，只看滤波差异
-   2) PLL 参数对比：滤波固定，不把别的因素掺进来
-   3) 切换保护对比：滤波和 PLL 都固定，只看保护开关前后 */
+   1) 滤波方法对比：只看不同滤波器的差别
+   2) PLL 参数对比：只看 PLL 的 Kp/Ki / 分程差异
+   3) 切换保护对比：只看保护开关前后有没有改善
+   这样老师问的时候，咱们可以直接说清楚“这一轮到底在比什么”。 */
 #define MC_DEMO_MODE_FILTER_COMPARE          1U
 #define MC_DEMO_MODE_PLL_COMPARE             2U
 #define MC_DEMO_MODE_SWITCH_COMPARE          3U
 #define MC_DEMO_MODE                         MC_DEMO_MODE_FILTER_COMPARE
 
 /* 滤波演示时，是否顺带启用启动切换保护。
-   默认关掉，保证“滤波对比”尽量干净；如果你想现场演示“同一批滤波器 + 开保护”，
-   就把这里改成 1U，不用去每个配置项里逐个改。 */
+   默认先关掉，这样滤波差异更纯；如果现场想展示“同一批滤波器 + 保护开关”的效果，
+   只改这里就行，不需要去每个配置项里逐条翻。 */
 #define MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE 0U
 
 #define MC_EXPERIMENT_BASE_SPEED_RPM         ((int16_t)500)
@@ -69,6 +70,8 @@ extern UART_HandleTypeDef huart2;
 #define MC_EXPERIMENT_START_TIMEOUT_MS       ((uint16_t)2500)
 #define MC_EXPERIMENT_INTER_SESSION_WAIT_MS  ((uint16_t)1000)
 
+/* 启动切换保护的三个核心门限。
+   这几个值不是“玄学参数”，而是我们后面实验里专门用来压低速毛刺和切换顿挫的。 */
 #define MC_STARTUP_SWITCH_MIN_SPEED_RPM      ((int16_t)120)
 #define MC_STARTUP_SWITCH_STABLE_MS          ((uint16_t)120)
 #define MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES  ((uint16_t)5)
@@ -122,13 +125,16 @@ static volatile uint16_t hStopPermanencyCounterM1 = ((uint16_t)0);
 static volatile uint8_t bMCBootCompleted = ((uint8_t)0);
 
 /* USER CODE BEGIN Private Variables */
-/* 这里单独拷一份速度传感器句柄，把滤波后的速度再送回速度环 */
+/* 这里单独拷一份速度传感器句柄。
+   后面我们不是只“画滤波曲线”，而是真的把这个句柄再送回速度环里。 */
 static SpeednPosFdbk_Handle_t SpeedFilterSensorM1;
+/* 当前实验里正在用哪种滤波方法。 */
 static MC_SpeedFilterMode_t g_mcSpeedFilterMode = MC_SPEED_FILTER_LPF1;
 static uint8_t g_mcSpeedFilterLpfShift = 3U;
 static int16_t g_mcRawMecSpeedUnit = 0;
 static int16_t g_mcFilteredMecSpeedUnit = 0;
-/* 这些状态量都是为了做不同滤波方法轮换实验 */
+/* 下面这些状态量，都是给不同滤波方法轮换实验准备的。
+   看起来有点多，但其实每个方法都只管自己那一套状态。 */
 static int16_t g_mcMovingAvgBuffer[MC_SPEED_FILTER_MOVAVG_DEPTH];
 static uint8_t g_mcMovingAvgIndex = 0U;
 static int32_t g_mcMovingAvgSum = 0;
@@ -212,7 +218,8 @@ typedef enum
 } MC_ExperimentStopReason_t;
 
 /* 这一组是给老师现场演示“滤波方法对比”用的。
-   PLL 固定住；启动保护默认跟着总宏走，平时建议先关掉，这样更容易把滤波差异单独讲清楚。 */
+   PLL 固定住；启动保护默认跟着总宏走。
+   这样做的意思是：主线仍然是滤波，但你如果想现场顺带看保护开关效果，也留了口子。 */
 static const MC_ExperimentConfig_t g_mcFilterCompareConfigs[] =
 {
   {MC_SPEED_FILTER_NONE,       3U, "NONE",    "none",              2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
@@ -225,7 +232,7 @@ static const MC_ExperimentConfig_t g_mcFilterCompareConfigs[] =
 };
 
 /* 这一组专门看 PLL 估计器自身。
-   所以滤波固定成 NONE，启动保护也先关掉，避免把别的改进一起算进去。 */
+   所以滤波固定成 NONE，启动保护也先关掉，避免把别的改进一起掺进来。 */
 static const MC_ExperimentConfig_t g_mcPllCompareConfigs[] =
 {
   {MC_SPEED_FILTER_NONE, 3U, "PLL_FIX",   "kp165_ki4",                       2U, 4U, 18, 40, 64U, 0U, 165, 4, 165, 4, 18, 40, 64U, 0U},
@@ -236,14 +243,17 @@ static const MC_ExperimentConfig_t g_mcPllCompareConfigs[] =
 };
 
 /* 这一组就是给“有无切换保护”现场演示用的。
-   两组除了 startupProtectEnable 以外都一样，这样老师一眼就能明白在比什么。 */
+   两组除了 startupProtectEnable 以外都一样，这样就能明确地比较“保护开/关”的差别。 */
 static const MC_ExperimentConfig_t g_mcSwitchCompareConfigs[] =
 {
   {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "protect_off", 2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, 0U},
   {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "protect_on",  2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, 1U}
 };
 
+/* 当前轮实验是否允许启动切换保护。 */
 static uint8_t g_mcStartupProtectEnable = 1U;
+/* 下面两个计数器就是保护逻辑的小记忆：
+   一个记“稳定了多久”，一个记“连续确认了几拍”。 */
 static uint32_t g_mcStartupSwitchStableTick = 0U;
 static uint16_t g_mcStartupEstimateConfirmCounter = 0U;
 
@@ -285,39 +295,189 @@ bool TSK_ChargeBootCapDelayHasElapsedM1(void);
 void TSK_SetStopPermanencyTimeM1(uint16_t hTickCount);
 bool TSK_StopPermanencyTimeHasElapsedM1(void);
 void TSK_SafetyTask_PWMOFF(uint8_t motor);
+/**
+  * @brief  把速度滤波器内部状态清零。
+  * @note   一般在切换滤波模式、重新开始一组实验时调用。
+  * @retval None
+  */
 static void MC_SPEED_FilterReset(void);
+/**
+  * @brief  用原始传感器句柄初始化滤波器状态。
+  * @param  pSource 原始速度/位置反馈句柄。
+  * @retval None
+  */
 static void MC_SPEED_FilterInitFromSensor(const SpeednPosFdbk_Handle_t *pSource);
+/**
+  * @brief  根据原始速度值更新当前滤波输出。
+  * @param  pSource 原始速度/位置反馈句柄。
+  * @param  rawSpeedUnit 当前采样到的原始机械速度，内部单位。
+  * @retval None
+  */
 static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource, int16_t rawSpeedUnit);
+/**
+  * @brief  把瞬时速度状态同步到外层句柄。
+  * @param  pSource 原始速度/位置反馈句柄。
+  * @retval None
+  */
 static void MC_SPEED_FilterSyncInstantaneousState(const SpeednPosFdbk_Handle_t *pSource);
+/**
+  * @brief  重置 PLL 分程调参状态。
+  * @retval None
+  */
 static void MC_PLL_TuningReset(void);
+/**
+  * @brief  从实验配置里读取 PLL 分程参数。
+  * @param  pConfig 当前实验配置。
+  * @retval None
+  */
 static void MC_PLL_TuningApply(const MC_ExperimentConfig_t *pConfig);
+/**
+  * @brief  按当前速度和阈值切换 PLL 的 Kp/Ki。
+  * @retval None
+  */
 static void MC_PLL_TuningUpdate(void);
 
 /* USER CODE BEGIN Private Functions */
+/**
+  * @brief  取当前实验模式对应的配置表。
+  * @retval 配置表首地址。
+  */
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetConfigTable(void);
+/**
+  * @brief  取当前实验模式的配置数量。
+  * @retval 配置数量。
+  */
 static uint8_t MC_EXPERIMENT_GetConfigCount(void);
+/**
+  * @brief  取当前实验系列的短名称。
+  * @retval 系列名称字符串指针。
+  */
 static const char *MC_EXPERIMENT_GetSeriesName(void);
+/**
+  * @brief  取当前正在执行的配置项。
+  * @retval 当前配置项指针。
+  */
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetCurrentConfig(void);
+/**
+  * @brief  把某个配置项真正应用到滤波器、PLL 和保护逻辑上。
+  * @param  pConfig 目标配置。
+  * @retval None
+  */
 static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig);
+/**
+  * @brief  启动一轮实验。
+  * @retval None
+  */
 static void MC_EXPERIMENT_StartSequence(void);
+/**
+  * @brief  请求结束当前实验。
+  * @param  stopReason 停止原因。
+  * @retval None
+  */
 static void MC_EXPERIMENT_RequestStop(uint8_t stopReason);
+/**
+  * @brief  根据当前状态推进实验流程并采样。
+  * @retval None
+  */
 static void MC_EXPERIMENT_HandlePeriodicSample(void);
+/**
+  * @brief  采集一条正式数据并放入发送队列。
+  * @param  phase 当前实验阶段。
+  * @param  stopReason 停止原因。
+  * @retval None
+  */
 static void MC_EXPERIMENT_PushSample(uint8_t phase, uint8_t stopReason);
+/**
+  * @brief  采集一条元信息帧，比如 session 开始/结束标记。
+  * @param  phase 当前实验阶段。
+  * @param  stopReason 停止原因。
+  * @retval None
+  */
 static void MC_EXPERIMENT_PushMetaFrame(uint8_t phase, uint8_t stopReason);
+/**
+  * @brief  判断发送队列是否满了。
+  * @retval 1 表示满，0 表示没满。
+  */
 static uint8_t MC_EXPERIMENT_IsQueueFull(void);
+/**
+  * @brief  判断发送队列是否为空。
+  * @retval 1 表示空，0 表示非空。
+  */
 static uint8_t MC_EXPERIMENT_IsQueueEmpty(void);
+/**
+  * @brief  向实验发送队列写入一条记录。
+  * @param  pSample 待写入的数据。
+  * @retval None
+  */
 static void MC_EXPERIMENT_QueueWrite(const MC_ExperimentSample_t *pSample);
+/**
+  * @brief  从实验发送队列读出一条记录。
+  * @param  pSample 读出后放到这里。
+  * @retval 1 表示读到了数据，0 表示队列空。
+  */
 static uint8_t MC_EXPERIMENT_QueueRead(MC_ExperimentSample_t *pSample);
+/**
+  * @brief  如果串口状态允许，就尽量把队列里的文本发出去。
+  * @retval None
+  */
 static void MC_EXPERIMENT_SendTextIfPossible(void);
+/**
+  * @brief  把实验采样数据格式化成 CSV 一行。
+  * @param  pSample 输入样本。
+  * @param  pBuffer 输出缓冲区。
+  * @param  bufferSize 缓冲区大小。
+  * @retval None
+  */
 static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, char *pBuffer, uint16_t bufferSize);
+/**
+  * @brief  根据当前电机状态更新实验状态机。
+  * @retval None
+  */
 static void MC_EXPERIMENT_UpdateStateByMotorState(void);
+/**
+  * @brief  推进当前实验的速度脚本。
+  * @retval None
+  */
 static void MC_EXPERIMENT_UpdateSpeedProfile(void);
+/**
+  * @brief  获取当前实验已经运行了多少毫秒。
+  * @retval 已经过的时间，单位 ms。
+  */
 static uint32_t MC_EXPERIMENT_GetElapsedMs(void);
+/**
+  * @brief  把阶段枚举转换成字符串。
+  * @param  phase 阶段编号。
+  * @retval 阶段名字符串。
+  */
 static const char *MC_EXPERIMENT_PhaseName(uint8_t phase);
+/**
+  * @brief  把停止原因枚举转换成字符串。
+  * @param  stopReason 停止原因编号。
+  * @retval 原因名字符串。
+  */
 static const char *MC_EXPERIMENT_StopReasonName(uint8_t stopReason);
+/**
+  * @brief  判断这一轮实验是否允许被启动。
+  * @retval 1 表示允许，0 表示不允许。
+  */
 static uint8_t MC_EXPERIMENT_IsStartAllowed(void);
+/**
+  * @brief  判断停机流程是否已经收尾完成。
+  * @param  motorState 当前电机状态。
+  * @retval 1 表示已完成，0 表示还没完成。
+  */
 static uint8_t MC_EXPERIMENT_IsStopFinished(MCI_State_t motorState);
+/**
+  * @brief  如果启动阶段卡太久，就直接中止这轮实验。
+  * @param  motorState 当前电机状态。
+  * @retval None
+  */
 static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState);
+/**
+  * @brief  判断启动切换保护是否满足切换条件。
+  * @param  loopClosed 当前是否已经闭环。
+  * @retval 1 表示可以切换，0 表示还不行。
+  */
 static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed);
 
 /* USER CODE END Private Functions */
@@ -765,7 +925,8 @@ __weak void TSK_MediumFrequencyTaskM1(void)
               /* 原版这里基本上是“看起来能闭环了就切过去”。
                  我们这里多包一层判断：
                  1. 如果演示的是无保护基线，就直接放行；
-                 2. 如果开了保护，就要求速度先过最小门限，并且连续稳定一小段时间。 */
+                 2. 如果开了保护，就要求速度先过最小门限，并且连续稳定一小段时间。
+                 这么做主要是为了把低速毛刺和切换顿挫压下去。 */
               SwitchReady = MC_STARTUP_IsSwitchReady((uint8_t)((true == LoopClosed) ? 1U : 0U));
 
               if (SwitchReady != 0U)
@@ -782,7 +943,8 @@ __weak void TSK_MediumFrequencyTaskM1(void)
 
               /* USER CODE END MediumFrequencyTask M1 1 */
                 /* 这里就是我们这次课设真正接管速度环的位置。
-                   前面做的滤波、PLL 调整、启动保护，最后都会体现在这个速度反馈源上。 */
+                   前面做的滤波、PLL 调整、启动保护，最后都会体现在这个速度反馈源上。
+                   也就是说，滤波不是只拿来看的，而是会真的影响控制。 */
                 STC_SetSpeedSensor(pSTC[M1], &SpeedFilterSensorM1); /* Filtered observer speed */
                 FOC_InitAdditionalMethods(M1);
                 FOC_CalcCurrRef( M1 );
@@ -1510,6 +1672,8 @@ int16_t MC_SPEED_GetFilteredSpeedRpm(void)
 
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetConfigTable(void)
 {
+  /* 这里相当于一个总分发。
+     现场只改 MC_DEMO_MODE，下面的配置表就会自动切到对应那一组。 */
 #if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
   return g_mcPllCompareConfigs;
 #elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
@@ -1521,6 +1685,7 @@ static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetConfigTable(void)
 
 static uint8_t MC_EXPERIMENT_GetConfigCount(void)
 {
+  /* 返回当前模式下到底有几组实验，后面自动连跑和下标保护都靠它。 */
 #if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
   return (uint8_t)(sizeof(g_mcPllCompareConfigs) / sizeof(g_mcPllCompareConfigs[0]));
 #elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
@@ -1532,6 +1697,7 @@ static uint8_t MC_EXPERIMENT_GetConfigCount(void)
 
 static const char *MC_EXPERIMENT_GetSeriesName(void)
 {
+  /* 串口 footer 里会带这个系列名，方便后面按模式归档 CSV。 */
 #if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
   return "pll_compare_demo";
 #elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
@@ -1543,6 +1709,8 @@ static const char *MC_EXPERIMENT_GetSeriesName(void)
 
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetCurrentConfig(void)
 {
+  /* 当前这轮用哪一组配置。
+     如果下标不小心越界了，直接拉回 0，别让现场演示崩在数组越界上。 */
   const MC_ExperimentConfig_t *pTable = MC_EXPERIMENT_GetConfigTable();
   uint8_t configCount = MC_EXPERIMENT_GetConfigCount();
 
@@ -1556,6 +1724,8 @@ static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetCurrentConfig(void)
 
 static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig)
 {
+  /* 这一段就是把“配置表里的参数”真正写进运行状态里。
+     所以它不是摆设，是真正决定这一轮实验怎么跑的。 */
   if (pConfig == MC_NULL)
   {
     return;
@@ -1569,6 +1739,7 @@ static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig)
   g_mcAdaptiveExitRpm = pConfig->adaptiveExitRpm;
   g_mcAdaptiveConfirmN = pConfig->adaptiveConfirmN;
   g_mcStartupProtectEnable = pConfig->startupProtectEnable;
+  /* 每轮重新开始前，把保护逻辑的小状态清掉，不然上一轮的稳定计数会串到下一轮。 */
   g_mcStartupSwitchStableTick = 0U;
   g_mcStartupEstimateConfirmCounter = 0U;
   MC_PLL_TuningApply(pConfig);
@@ -1578,13 +1749,16 @@ static void MC_EXPERIMENT_StartSequence(void)
 {
   const MC_ExperimentConfig_t *pConfig = MC_EXPERIMENT_GetCurrentConfig();
 
+  /* 先应用当前配置，再起电机。
+     这样一开始拿到的就是这一轮要测试的参数。 */
   MC_EXPERIMENT_ApplyConfig(pConfig);
   g_mcExperimentBoostIssued = 0U;
   g_mcExperimentReturnIssued = 0U;
-  /* 先把第一次目标速度设成 500rpm，后续再按时间切到 1000rpm 再回到 500rpm */
+  /* 先把第一次目标速度设成 500rpm。
+     后面再按时间切到 1000rpm，再回到 500rpm，这样曲线才有“阶跃”和“回落”两个段。 */
   if (MC_StartMotor1() == false)
   {
-    /* 启动命令没接收成功时，直接放弃本轮，避免卡在“只发表头”的假启动状态 */
+    /* 启动命令没接收成功时，直接放弃本轮，避免卡在“只发表头”的假启动状态。 */
     return;
   }
 
@@ -1595,6 +1769,7 @@ static void MC_EXPERIMENT_StartSequence(void)
   g_mcExperimentStartTick = HAL_GetTick();
   g_mcExperimentLastSampleTick = g_mcExperimentStartTick;
   g_mcExperimentStopTick = 0U;
+  /* 串口输出是按“先表头、后数据、最后 footer”顺序来的。 */
   g_mcExperimentHeaderPending = 1U;
   g_mcExperimentFooterPending = 0U;
   g_mcExperimentAdvanceConfigPending = 0U;
@@ -1610,6 +1785,7 @@ static void MC_EXPERIMENT_StartSequence(void)
 
 static void MC_EXPERIMENT_RequestStop(uint8_t stopReason)
 {
+  /* 停止请求只发一次，别在 stop 状态里反复发。 */
   if ((g_mcExperimentPhase == MC_EXPERIMENT_PHASE_STOP) ||
       (g_mcExperimentPhase == MC_EXPERIMENT_PHASE_DONE) ||
       (g_mcExperimentTextModeEnabled == 0U))
@@ -1628,6 +1804,7 @@ static void MC_EXPERIMENT_HandlePeriodicSample(void)
 {
   uint32_t nowTick;
 
+  /* 只有在实验进行中才采样，空闲态不乱记。 */
   if (g_mcExperimentTextModeEnabled == 0U)
   {
     return;
@@ -1647,8 +1824,8 @@ static void MC_EXPERIMENT_HandlePeriodicSample(void)
   }
 
   g_mcExperimentLastSampleTick = nowTick;
+  /* 采样和速度轨迹更新分开做，这样日志点更稳定。 */
   MC_EXPERIMENT_PushSample((uint8_t)g_mcExperimentPhase, g_mcExperimentStopReason);
-
   MC_EXPERIMENT_UpdateSpeedProfile();
 }
 
@@ -1657,6 +1834,7 @@ static void MC_EXPERIMENT_PushSample(uint8_t phase, uint8_t stopReason)
   MC_ExperimentSample_t sample;
   const MC_ExperimentConfig_t *pConfig = MC_EXPERIMENT_GetCurrentConfig();
 
+  /* 队列满了就先别写，避免把后面的样本挤没。 */
   if (MC_EXPERIMENT_IsQueueFull() != 0U)
   {
     return;
@@ -1667,6 +1845,7 @@ static void MC_EXPERIMENT_PushSample(uint8_t phase, uint8_t stopReason)
   sample.configIndex = (uint16_t)g_mcExperimentConfigIndex;
   sample.sampleIndex = g_mcExperimentSampleIndex++;
   sample.timeMs = MC_EXPERIMENT_GetElapsedMs();
+  /* 这里导出的都是现场分析最常看的那几个量。 */
   sample.targetSpeedRpm = (int16_t)MC_GetMecSpeedReferenceMotor1_F();
   sample.rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
   sample.filteredSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
@@ -1688,6 +1867,7 @@ static void MC_EXPERIMENT_PushMetaFrame(uint8_t phase, uint8_t stopReason)
   MC_ExperimentSample_t sample;
   const MC_ExperimentConfig_t *pConfig = MC_EXPERIMENT_GetCurrentConfig();
 
+  /* meta frame 也要走同一套队列，方便前端按 phase 识别 start/run/stop/done。 */
   if (MC_EXPERIMENT_IsQueueFull() != 0U)
   {
     return;
@@ -1758,6 +1938,8 @@ static void MC_EXPERIMENT_SendTextIfPossible(void)
 {
   MC_ExperimentSample_t sample;
 
+  /* 这条函数就是串口的出口。
+     先发表头，再一行一行发 CSV，最后交给前端去画。 */
   if (g_mcExperimentTextModeEnabled == 0U)
   {
     return;
@@ -1787,6 +1969,7 @@ static void MC_EXPERIMENT_SendTextIfPossible(void)
 
 static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, char *pBuffer, uint16_t bufferSize)
 {
+  /* 把结构体里的字段按 CSV 顺序排好，前端那边就能直接读。 */
   if ((pSample == MC_NULL) || (pBuffer == MC_NULL) || (bufferSize == 0U))
   {
     return;
@@ -1817,6 +2000,7 @@ static void MC_EXPERIMENT_UpdateStateByMotorState(void)
 {
   MCI_State_t motorState = MC_GetSTMStateMotor1();
 
+  /* 这段主要是把电机状态机的变化同步到我们自己的实验状态机里。 */
   if (g_mcExperimentTextModeEnabled == 0U)
   {
     return;
@@ -1828,12 +2012,14 @@ static void MC_EXPERIMENT_UpdateStateByMotorState(void)
     return;
   }
 
+  /* 从 START 进入 RUN，说明启动接管已经完成，开始记录正式运行阶段。 */
   if ((motorState == RUN) && (g_mcExperimentPhase == MC_EXPERIMENT_PHASE_START))
   {
     g_mcExperimentPhase = MC_EXPERIMENT_PHASE_RUN;
     MC_EXPERIMENT_PushMetaFrame(MC_EXPERIMENT_PHASE_RUN, g_mcExperimentStopReason);
   }
 
+  /* 停机后等速度真正落下来，再认为这一组结束。 */
   if ((g_mcExperimentPhase == MC_EXPERIMENT_PHASE_STOP) &&
       (MC_EXPERIMENT_IsStopFinished(motorState) != 0U))
   {
@@ -1858,6 +2044,7 @@ static void MC_EXPERIMENT_UpdateStateByMotorState(void)
 
 static uint32_t MC_EXPERIMENT_GetElapsedMs(void)
 {
+  /* 这一轮实验从 start tick 开始计时。 */
   return HAL_GetTick() - g_mcExperimentStartTick;
 }
 
@@ -1897,7 +2084,8 @@ static uint8_t MC_EXPERIMENT_IsStartAllowed(void)
 {
   MCI_State_t motorState = MC_GetSTMStateMotor1();
 
-  /* 这里把启动条件卡严一点，避免上一组结尾串口还没发完就立刻开始下一组 */
+  /* 这里把启动条件卡严一点，避免上一组结尾串口还没发完就立刻开始下一组。
+     现场手动连按 USER 键时，这个判断能减少一堆乱序情况。 */
   if (g_mcExperimentPhase != MC_EXPERIMENT_PHASE_IDLE)
   {
     return 0U;
@@ -1937,6 +2125,7 @@ static uint8_t MC_EXPERIMENT_IsStopFinished(MCI_State_t motorState)
   int16_t absFinalSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
   uint32_t stopElapsedMs = 0U;
 
+  /* 停机这块看的是“速度真的已经降下来了没”，不是只看 stop 指令发没发。 */
   if (absFinalSpeedRpm < 0)
   {
     absFinalSpeedRpm = (int16_t)(-absFinalSpeedRpm);
@@ -1967,6 +2156,7 @@ static uint8_t MC_EXPERIMENT_IsStopFinished(MCI_State_t motorState)
 
 static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState)
 {
+  /* 如果启动阶段超时了但还是没进 RUN，说明这轮就别硬撑了，直接回空闲。 */
   if (g_mcExperimentPhase != MC_EXPERIMENT_PHASE_START)
   {
     return;
@@ -1995,6 +2185,9 @@ static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState)
 
 void MC_EXPERIMENT_BackgroundTask(void)
 {
+  /* 后台任务主要干两件事：
+     1. 尽量把队列里的 CSV 发出去
+     2. 如果一组结束了，就决定下一组要不要自动开 */
   MC_EXPERIMENT_SendTextIfPossible();
 
   if ((g_mcExperimentFooterPending != 0U) &&
@@ -2024,7 +2217,7 @@ void MC_EXPERIMENT_BackgroundTask(void)
       }
     }
 
-    /* 这里先把状态切回空闲，避免串口返回值不稳定时一直狂刷 session_end */
+    /* 这里先把状态切回空闲，避免串口返回值不稳定时一直狂刷 session_end。 */
     g_mcExperimentFooterPending = 0U;
     g_mcExperimentTextModeEnabled = 0U;
     g_mcExperimentPhase = MC_EXPERIMENT_PHASE_IDLE;
@@ -2033,7 +2226,7 @@ void MC_EXPERIMENT_BackgroundTask(void)
     g_mcExperimentBoostIssued = 0U;
     g_mcExperimentReturnIssued = 0U;
     /* 最后一组跑完后必须明确撤掉自动连跑标志，
-       否则会在 cfg 保持不变时重复启动最后一组。 */
+       不然 cfg 保持不变时会重复启动最后一组。 */
     g_mcExperimentAutoBatchArmed = 0U;
     g_mcExperimentNextStartTick = 0U;
     g_mcExperimentConfigIndex = nextConfigIndex;
@@ -2066,6 +2259,8 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
 {
   uint32_t elapsedMs;
 
+  /* 速度轨迹这块就是固定脚本：
+     500 -> 1000 -> 500 -> stop，目的是让启动、提速、回落、停机都能看出来。 */
   if ((g_mcExperimentTextModeEnabled == 0U) ||
       ((g_mcExperimentPhase != MC_EXPERIMENT_PHASE_START) &&
        (g_mcExperimentPhase != MC_EXPERIMENT_PHASE_RUN)))
@@ -2075,6 +2270,7 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
 
   elapsedMs = MC_EXPERIMENT_GetElapsedMs();
 
+  /* 到点之后提到 1000rpm。 */
   if ((g_mcExperimentBoostIssued == 0U) &&
       (elapsedMs >= (uint32_t)MC_EXPERIMENT_SPEED_HOLD_MS))
   {
@@ -2082,6 +2278,7 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
     g_mcExperimentBoostIssued = 1U;
   }
 
+  /* 再过一段时间回到 500rpm，看看降速和重新稳住的表现。 */
   if ((g_mcExperimentReturnIssued == 0U) &&
       (elapsedMs >= ((uint32_t)MC_EXPERIMENT_SPEED_HOLD_MS + (uint32_t)MC_EXPERIMENT_SPEED_HOLD_MS)))
   {
@@ -2089,6 +2286,7 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
     g_mcExperimentReturnIssued = 1U;
   }
 
+  /* 最后自动停机，减少人工按键误差。 */
   if ((g_mcExperimentAutoStopIssued == 0U) &&
       (elapsedMs >= (uint32_t)MC_EXPERIMENT_TOTAL_RUN_MS))
   {
@@ -2098,6 +2296,7 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
 
 static void MC_PLL_TuningReset(void)
 {
+  /* 分程 PLL 的当前阶段先回到快段。 */
   g_mcPllCurrentStage = 0U;
   g_mcPllStableCounter = 0U;
   g_mcPllActiveKp = g_mcPllFastKp;
@@ -2108,6 +2307,7 @@ static void MC_PLL_TuningReset(void)
 
 static void MC_PLL_TuningApply(const MC_ExperimentConfig_t *pConfig)
 {
+  /* 把配置表里的 PLL 参数拷出来，后面 Update 时就按这套阈值切换。 */
   if (pConfig == MC_NULL)
   {
     return;
@@ -2129,6 +2329,7 @@ static void MC_PLL_TuningUpdate(void)
   int16_t absSpeedRpm;
   uint8_t nextStage;
 
+  /* 如果没有启用分程，就不需要做这一套阶段切换。 */
   if (g_mcPllSplitEnable == 0U)
   {
     return;
@@ -2142,6 +2343,7 @@ static void MC_PLL_TuningUpdate(void)
 
   nextStage = g_mcPllCurrentStage;
 
+  /* stage 0：快段，主要负责低速和过渡时的响应。 */
   if (g_mcPllCurrentStage == 0U)
   {
     if (absSpeedRpm >= g_mcPllSplitEnterRpm)
@@ -2160,6 +2362,7 @@ static void MC_PLL_TuningUpdate(void)
       g_mcPllStableCounter = 0U;
     }
   }
+  /* stage 1：慢段，主要负责速度已经上来之后的平稳性。 */
   else
   {
     if (absSpeedRpm <= g_mcPllSplitExitRpm)
@@ -2179,6 +2382,7 @@ static void MC_PLL_TuningUpdate(void)
     }
   }
 
+  /* 阶段真的切换后，才把新的 Kp/Ki 写给 PLL。 */
   if (nextStage != g_mcPllCurrentStage)
   {
     g_mcPllCurrentStage = nextStage;
@@ -2203,6 +2407,8 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   int16_t rawSpeedRpm;
   uint32_t nowTick;
 
+  /* 这就是启动切换保护的核心判断。
+     不是单纯“能闭环了”就接管，而是再确认一下速度真的稳定没。 */
   if (loopClosed == 0U)
   {
     g_mcStartupSwitchStableTick = 0U;
@@ -2210,11 +2416,13 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
     return 0U;
   }
 
+  /* 保护关掉时就直接放行，方便做基线对比。 */
   if (g_mcStartupProtectEnable == 0U)
   {
     return 1U;
   }
 
+  /* 先看滤波后的速度是不是已经过门限。 */
   filteredSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
   if (filteredSpeedRpm < MC_STARTUP_SWITCH_MIN_SPEED_RPM)
   {
@@ -2223,6 +2431,8 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
     return 0U;
   }
 
+  /* 再看原始速度有没有明显反向。
+     这一步是为了专门压低速时那种“看起来突然倒一下”的毛刺。 */
   rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
   if (rawSpeedRpm < 0)
   {
@@ -2231,6 +2441,7 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
     return 0U;
   }
 
+  /* 连续确认几拍，别因为一拍正常就立刻放行。 */
   if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
   {
     g_mcStartupEstimateConfirmCounter++;
@@ -2242,12 +2453,14 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   }
 
   nowTick = HAL_GetTick();
+  /* 真正开始计稳定时长。 */
   if (g_mcStartupSwitchStableTick == 0U)
   {
     g_mcStartupSwitchStableTick = nowTick;
     return 0U;
   }
 
+  /* 稳定时长还没到，就继续等。 */
   if ((nowTick - g_mcStartupSwitchStableTick) < (uint32_t)MC_STARTUP_SWITCH_STABLE_MS)
   {
     return 0U;

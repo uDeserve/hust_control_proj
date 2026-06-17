@@ -1,6 +1,7 @@
 const state = {
   datasets: [],
   columns: [],
+  analysisMode: "filter",
   xColumn: "",
   yColumn: "",
   y2Column: "",
@@ -38,6 +39,9 @@ const dom = {
   csvInput: document.getElementById("csvInput"),
   dropZone: document.getElementById("dropZone"),
   clearAllBtn: document.getElementById("clearAllBtn"),
+  analysisModeSelect: document.getElementById("analysisModeSelect"),
+  modeGuideTitle: document.getElementById("modeGuideTitle"),
+  modeGuideText: document.getElementById("modeGuideText"),
   presetRawFilteredBtn: document.getElementById("presetRawFilteredBtn"),
   presetFilteredTargetBtn: document.getElementById("presetFilteredTargetBtn"),
   presetStartupBtn: document.getElementById("presetStartupBtn"),
@@ -65,10 +69,13 @@ const dom = {
   currentYLabel: document.getElementById("currentYLabel"),
   windowLabel: document.getElementById("windowLabel"),
   statsTableBody: document.querySelector("#statsTable tbody"),
+  experimentTableHeadRow: document.getElementById("experimentTableHeadRow"),
   experimentTableBody: document.querySelector("#experimentTable tbody"),
+  experimentMetricNote: document.getElementById("experimentMetricNote"),
   exportPngBtn: document.getElementById("exportPngBtn"),
   canvas: document.getElementById("chartCanvas"),
-  smallMultiplesGrid: document.getElementById("smallMultiplesGrid")
+  smallMultiplesGrid: document.getElementById("smallMultiplesGrid"),
+  legendExplainList: document.getElementById("legendExplainList")
 };
 
 const methodLabelMap = {
@@ -76,7 +83,37 @@ const methodLabelMap = {
   LPF1: "LPF1：一阶低通",
   MOVAVG8: "MOVAVG8：8点滑动平均",
   WMA4: "WMA4：4点加权平均",
-  ADALPF: "ADALPF：自适应低通"
+  ADALPF: "ADALPF：自适应低通",
+  PLL_FIX: "PLL_FIX：固定参数锁相环",
+  PLL_SPLIT: "PLL_SPLIT：分程参数锁相环"
+};
+
+const shortMethodLabelMap = {
+  NONE: "无滤波",
+  LPF1: "一阶低通",
+  MOVAVG8: "滑动平均",
+  WMA4: "加权平均",
+  ADALPF: "自适应低通",
+  PLL_FIX: "固定PLL",
+  PLL_SPLIT: "分程PLL"
+};
+
+const analysisModeMap = {
+  filter: {
+    title: "滤波方法对比",
+    description:
+      "重点看原始速度、滤波速度和目标速度之间的差别，适合展示不同滤波方法在启动、调速和稳态阶段的效果。"
+  },
+  pll: {
+    title: "PLL PI 参数对比",
+    description:
+      "重点看不同 PLL 参数组合下原始速度估计的动态差异。PLL 的 Kp、Ki 直接作用于估计器内部锁相环，因此这里默认比较原始速度与目标转速，而不混入控制使用速度。"
+  },
+  switch: {
+    title: "切换保护对比",
+    description:
+      "重点看启动到闭环切换附近的平顺性，观察是否存在切换顿挫、速度突跳、反向毛刺，以及保护处理是否有效。"
+  }
 };
 
 const ctx = dom.canvas.getContext("2d");
@@ -91,6 +128,12 @@ function bindEvents() {
   dom.presetFilteredTargetBtn.addEventListener("click", applyPresetFilteredTarget);
   dom.presetStartupBtn.addEventListener("click", applyPresetStartup);
   dom.presetSteadyBtn.addEventListener("click", applyPresetSteadyState);
+  dom.analysisModeSelect.addEventListener("change", () => {
+    state.analysisMode = dom.analysisModeSelect.value;
+    renderModeGuide();
+    applyModeDefaults();
+    renderAll();
+  });
 
   dom.xColumnSelect.addEventListener("change", () => {
     state.xColumn = dom.xColumnSelect.value;
@@ -320,13 +363,48 @@ function assignDatasetColors() {
 }
 
 function renderAll() {
+  renderModeGuide();
+  renderPresetButtonLabels();
   renderColumnSelectors();
   renderDatasetList();
   renderSeriesList();
   renderSummary();
   renderStatsTable();
+  renderExperimentTableHeader();
   renderExperimentTable();
+  renderExperimentMetricNote();
   renderChart();
+  renderLegendExplainBox();
+}
+
+function renderModeGuide() {
+  const modeMeta = analysisModeMap[state.analysisMode] || analysisModeMap.filter;
+  dom.analysisModeSelect.value = state.analysisMode;
+  dom.modeGuideTitle.textContent = modeMeta.title;
+  dom.modeGuideText.textContent = modeMeta.description;
+}
+
+function renderPresetButtonLabels() {
+  if (state.analysisMode === "pll") {
+    dom.presetRawFilteredBtn.textContent = "参数 vs 目标";
+    dom.presetFilteredTargetBtn.textContent = "PLL 内部量";
+    dom.presetStartupBtn.textContent = "启动切入";
+    dom.presetSteadyBtn.textContent = "稳态调速";
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    dom.presetRawFilteredBtn.textContent = "切换前后";
+    dom.presetFilteredTargetBtn.textContent = "最终速度 vs 目标";
+    dom.presetStartupBtn.textContent = "切换放大";
+    dom.presetSteadyBtn.textContent = "切换后稳态";
+    return;
+  }
+
+  dom.presetRawFilteredBtn.textContent = "原始 vs 滤波";
+  dom.presetFilteredTargetBtn.textContent = "滤波 vs 目标";
+  dom.presetStartupBtn.textContent = "启动放大";
+  dom.presetSteadyBtn.textContent = "稳态波动";
 }
 
 function renderColumnSelectors() {
@@ -380,7 +458,7 @@ function renderDatasetList() {
 
     const header = document.createElement("header");
     const title = document.createElement("strong");
-    title.textContent = dataset.name;
+    title.textContent = buildShortDatasetLabel(dataset);
 
     const toggleWrap = document.createElement("label");
     toggleWrap.className = "dataset-toggle";
@@ -400,7 +478,11 @@ function renderDatasetList() {
 
     const meta = document.createElement("div");
     meta.className = "dataset-meta";
+    const datasetMeta = extractDatasetMeta(dataset);
     meta.innerHTML = [
+      `完整说明：${escapeHtml(buildFullDatasetLabel(dataset))}`,
+      `原始文件：${escapeHtml(dataset.name)}`,
+      `方法说明：${escapeHtml(datasetMeta.methodName)}`,
       `列数：${dataset.headers.length}`,
       `采样点：${dataset.rows.length}`,
       `主要列：${dataset.headers.slice(0, 5).join(" / ")}`
@@ -471,7 +553,7 @@ function renderSummary() {
   dom.datasetCount.textContent = String(visibleDatasets.length);
   dom.pointCount.textContent = String(pointCount);
 
-  const labels = [state.yColumn, state.compareColumn].filter(Boolean);
+  const labels = [state.yColumn, state.compareColumn, state.showY2 ? state.y2Column : ""].filter(Boolean);
   dom.currentYLabel.textContent = labels.length ? labels.join(" + ") : "未选择";
 
   const hasCustomRange = Object.values(state.ranges).some((value) => value !== null);
@@ -537,6 +619,8 @@ function buildSeriesFromDataset(dataset, datasetIndex, spec) {
     return null;
   }
 
+  const phaseColumn = dataset.headers.includes("phase") ? "phase" : "";
+
   const rows = dataset.rows
     .map((row) => {
       const x = row[state.xColumn];
@@ -544,7 +628,12 @@ function buildSeriesFromDataset(dataset, datasetIndex, spec) {
       if (!isFiniteNumber(x) || !isFiniteNumber(y)) {
         return null;
       }
-      return { x, y };
+      return {
+        x,
+        y,
+        phase: phaseColumn ? String(row[phaseColumn] || "") : "",
+        breakAfter: false
+      };
     })
     .filter(Boolean);
 
@@ -559,11 +648,13 @@ function buildSeriesFromDataset(dataset, datasetIndex, spec) {
     });
   }
 
+  markDiscontinuities(rows, spec.column);
+
   return {
     id: `${dataset.id}-${spec.axis}-${spec.column}`,
     datasetId: dataset.id,
     datasetName: dataset.name,
-    datasetLabel: buildDatasetLabel(dataset),
+    datasetLabel: buildShortDatasetLabel(dataset),
     datasetNote: dataset.note,
     datasetIndex,
     column: spec.column,
@@ -592,11 +683,54 @@ function pickSeriesLineDash(spec) {
     return [10, 8];
   }
 
+  const column = String(spec.column || "").toLowerCase();
+
+  if (state.analysisMode === "pll") {
+    if (column.includes("raw") && column.includes("speed")) {
+      return [];
+    }
+    if (column.includes("filtered") && column.includes("speed")) {
+      return [7, 5];
+    }
+    if (column.includes("final") && column.includes("speed")) {
+      return [7, 5];
+    }
+  }
+
+  if (column.includes("filtered") && column.includes("speed")) {
+    return [];
+  }
+
+  if (column.includes("raw") && column.includes("speed")) {
+    return [8, 6];
+  }
+
   if (spec.type === "compare") {
     return [7, 5];
   }
 
   return [];
+}
+
+function markDiscontinuities(rows, columnName) {
+  const column = String(columnName || "").toLowerCase();
+  const isSpeedColumn = column.includes("speed");
+  if (!isSpeedColumn || rows.length < 2) {
+    return;
+  }
+
+  for (let i = 0; i < rows.length - 1; i += 1) {
+    const current = rows[i];
+    const next = rows[i + 1];
+    const phaseChanged = current.phase && next.phase && current.phase !== next.phase;
+    const droppedToZero = Math.abs(next.y) < 1 && Math.abs(current.y) > 80;
+    const abruptJump = Math.abs(next.y - current.y) > 400;
+    const tinyTimeGap = Math.abs(next.x - current.x) <= 30;
+
+    if (tinyTimeGap && (phaseChanged && droppedToZero || abruptJump && droppedToZero)) {
+      current.breakAfter = true;
+    }
+  }
 }
 
 function renderStatsTable() {
@@ -625,6 +759,16 @@ function renderStatsTable() {
 function renderExperimentTable() {
   dom.experimentTableBody.innerHTML = "";
 
+  if (state.analysisMode === "pll") {
+    renderPllExperimentTable();
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    renderSwitchExperimentTable();
+    return;
+  }
+
   const summaries = state.datasets
     .filter((dataset) => dataset.visible)
     .map((dataset) => buildExperimentSummary(dataset))
@@ -652,6 +796,156 @@ function renderExperimentTable() {
       <td>${formatNumber(summary.steadyPeakToPeak)}</td>
       <td>${formatNumber(summary.overshoot)}</td>
       <td>${formatNumber(summary.totalDurationMs)}</td>
+    `;
+    dom.experimentTableBody.appendChild(tr);
+  });
+}
+
+function renderExperimentTableHeader() {
+  if (state.analysisMode === "pll") {
+    dom.experimentTableHeadRow.innerHTML = `
+      <th>文件</th>
+      <th>方法</th>
+      <th>参数</th>
+      <th>目标转速</th>
+      <th>启动最小速度</th>
+      <th>首次稳定为正(ms)</th>
+      <th>切换突跳</th>
+      <th>切换恢复(ms)</th>
+      <th>稳态原始速度标准差</th>
+      <th>稳态原始速度峰峰值</th>
+      <th>调速段原始速度标准差</th>
+      <th>是否有反向毛刺</th>
+    `;
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    dom.experimentTableHeadRow.innerHTML = `
+      <th>文件</th>
+      <th>版本</th>
+      <th>方法</th>
+      <th>参数</th>
+      <th>切换时刻(ms)</th>
+      <th>切换前速度</th>
+      <th>切换后速度</th>
+      <th>切换突跳</th>
+      <th>恢复到450rpm(ms)</th>
+      <th>启动最小速度</th>
+      <th>是否有反向毛刺</th>
+      <th>备注</th>
+    `;
+    return;
+  }
+
+  dom.experimentTableHeadRow.innerHTML = `
+    <th>文件</th>
+    <th>方法</th>
+    <th>参数</th>
+    <th>目标转速</th>
+    <th>上升时间(ms)</th>
+    <th>稳态建立(ms)</th>
+    <th>稳态均值</th>
+    <th>稳态误差</th>
+    <th>稳态标准差</th>
+    <th>稳态峰峰值</th>
+    <th>最大超调</th>
+    <th>总时长(ms)</th>
+  `;
+}
+
+function renderExperimentMetricNote() {
+  if (state.analysisMode === "pll") {
+    dom.experimentMetricNote.innerHTML = [
+      "<strong>PLL 模式指标说明：</strong>这里重点评价的是估计器原始速度，而不是闭环控制最终效果。",
+      "<strong>启动最小速度：</strong>看低速阶段是否出现明显反向毛刺。",
+      "<strong>首次稳定为正(ms)：</strong>看原始速度多久才能连续稳定到正确方向。",
+      "<strong>切换突跳 / 切换恢复(ms)：</strong>看 start 到 run 切换附近是否平顺。",
+      "<strong>稳态原始速度标准差 / 峰峰值：</strong>看估计值本身抖动大小。",
+      "<strong>调速段原始速度标准差：</strong>看 500->1000 或 1000->500 变化时原始估计波动是否更大。"
+    ].join("<br>");
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    dom.experimentMetricNote.innerHTML = [
+      "<strong>切换保护模式指标说明：</strong>这里重点评价启动到闭环切换附近是否平顺。",
+      "<strong>切换突跳：</strong>越小越说明切换更干净。",
+      "<strong>恢复到450rpm时间：</strong>越短说明切换后恢复更快。",
+      "<strong>启动最小速度 / 是否有反向毛刺：</strong>用于判断低速误判是否被压住。"
+    ].join("<br>");
+    return;
+  }
+
+  dom.experimentMetricNote.innerHTML = [
+    "<strong>滤波模式指标说明：</strong>这里重点评价滤波后速度的系统级表现。",
+    "<strong>上升时间 / 稳态建立：</strong>看动态响应速度。",
+    "<strong>稳态误差 / 稳态标准差 / 峰峰值：</strong>看稳态跟踪误差和抖动大小。",
+    "<strong>最大超调：</strong>看目标变化时是否冲得过头。"
+  ].join("<br>");
+}
+
+function renderPllExperimentTable() {
+  const summaries = state.datasets
+    .filter((dataset) => dataset.visible)
+    .map((dataset) => buildPllSummary(dataset))
+    .filter(Boolean);
+
+  if (!summaries.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = '<td colspan="12">导入包含 raw_speed_rpm、target_speed_rpm、phase 的 CSV 后，这里会自动生成 PLL 估计器指标。</td>';
+    dom.experimentTableBody.appendChild(tr);
+    return;
+  }
+
+  summaries.forEach((summary) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(summary.datasetLabel)}</td>
+      <td>${escapeHtml(summary.methodName)}</td>
+      <td>${escapeHtml(summary.paramTag)}</td>
+      <td>${formatNumber(summary.targetSpeed)}</td>
+      <td>${formatNumber(summary.startupMinSpeed)}</td>
+      <td>${formatNumber(summary.firstStablePositiveMs)}</td>
+      <td>${formatNumber(summary.switchJump)}</td>
+      <td>${formatNumber(summary.switchRecoverMs)}</td>
+      <td>${formatNumber(summary.steadyRawStd)}</td>
+      <td>${formatNumber(summary.steadyRawPeakToPeak)}</td>
+      <td>${formatNumber(summary.rampRawStd)}</td>
+      <td>${summary.hasReverseSpike ? "有" : "无"}</td>
+    `;
+    dom.experimentTableBody.appendChild(tr);
+  });
+}
+
+function renderSwitchExperimentTable() {
+  const summaries = state.datasets
+    .filter((dataset) => dataset.visible)
+    .map((dataset) => buildSwitchSummary(dataset))
+    .filter(Boolean);
+
+  if (!summaries.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = '<td colspan="12">导入包含 phase、final_speed_rpm、raw_speed_rpm 的 CSV 后，这里会自动生成切换保护指标。</td>';
+    dom.experimentTableBody.appendChild(tr);
+    return;
+  }
+
+  summaries.forEach((summary) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(summary.datasetLabel)}</td>
+      <td>${escapeHtml(summary.versionLabel)}</td>
+      <td>${escapeHtml(summary.methodName)}</td>
+      <td>${escapeHtml(summary.paramTag)}</td>
+      <td>${formatNumber(summary.switchTimeMs)}</td>
+      <td>${formatNumber(summary.preSwitchSpeed)}</td>
+      <td>${formatNumber(summary.postSwitchSpeed)}</td>
+      <td>${formatNumber(summary.switchJump)}</td>
+      <td>${formatNumber(summary.recover450Ms)}</td>
+      <td>${formatNumber(summary.startupMinSpeed)}</td>
+      <td>${summary.hasReverseSpike ? "有" : "无"}</td>
+      <td>${escapeHtml(summary.note)}</td>
     `;
     dom.experimentTableBody.appendChild(tr);
   });
@@ -721,7 +1015,7 @@ function buildExperimentSummary(dataset) {
 
   return {
     datasetName: dataset.name,
-    datasetLabel: buildDatasetLabel(dataset),
+    datasetLabel: buildShortDatasetLabel(dataset),
     methodName: meta.methodName,
     paramTag: meta.paramTag,
     targetSpeed,
@@ -734,6 +1028,226 @@ function buildExperimentSummary(dataset) {
     overshoot,
     totalDurationMs
   };
+}
+
+function buildPllSummary(dataset) {
+  const timeColumn = findDatasetColumn(dataset, ["time", "ms"]);
+  const rawColumn = findDatasetColumn(dataset, ["raw", "speed"]);
+  const targetColumn = findDatasetColumn(dataset, ["target", "speed"]);
+  const phaseColumn = findDatasetColumn(dataset, ["phase"]);
+
+  if (!timeColumn || !rawColumn || !targetColumn) {
+    return null;
+  }
+
+  const points = dataset.rows
+    .map((row) => {
+      const t = row[timeColumn];
+      const raw = row[rawColumn];
+      const target = row[targetColumn];
+      const phase = phaseColumn ? String(row[phaseColumn] || "") : "";
+      if (!isFiniteNumber(t) || !isFiniteNumber(raw) || !isFiniteNumber(target)) {
+        return null;
+      }
+      return { t, raw, target, phase };
+    })
+    .filter(Boolean);
+
+  if (points.length < 12) {
+    return null;
+  }
+
+  const startTime = points[0].t;
+  const normalized = points.map((point) => ({
+    ...point,
+    t: point.t - startTime
+  }));
+
+  const targetSpeed = pickRepresentativeTarget(points.map((point) => ({ target: point.target })));
+  const startupSegment = normalized.filter((point) => point.phase !== "run");
+  const startupMinSpeed = startupSegment.length
+    ? Math.min(...startupSegment.map((point) => point.raw))
+    : Math.min(...normalized.map((point) => point.raw));
+
+  const firstStablePositiveMs = findFirstStablePositiveTime(normalized, 20, 3);
+  const switchMetrics = computeSwitchMetricsFromRaw(normalized);
+  const steadyStats = computeRawSteadyStats(normalized, targetSpeed);
+  const rampRawStd = computeRampRawStd(normalized, targetSpeed);
+  const meta = extractDatasetMeta(dataset);
+
+  return {
+    datasetLabel: buildShortDatasetLabel(dataset),
+    methodName: meta.methodName,
+    paramTag: meta.paramTag,
+    targetSpeed,
+    startupMinSpeed,
+    firstStablePositiveMs,
+    switchJump: switchMetrics.switchJump,
+    switchRecoverMs: switchMetrics.switchRecoverMs,
+    steadyRawStd: steadyStats.std,
+    steadyRawPeakToPeak: steadyStats.peakToPeak,
+    rampRawStd,
+    hasReverseSpike: startupMinSpeed < -1
+  };
+}
+
+function findFirstStablePositiveTime(points, minSpeed, holdCount) {
+  for (let i = 0; i < points.length; i += 1) {
+    const window = points.slice(i, i + holdCount);
+    if (window.length < holdCount) {
+      break;
+    }
+    const ok = window.every((point) => point.raw >= minSpeed);
+    if (ok) {
+      return points[i].t;
+    }
+  }
+  return NaN;
+}
+
+function computeSwitchMetricsFromRaw(points) {
+  let switchIndex = -1;
+  for (let i = 1; i < points.length; i += 1) {
+    if (points[i - 1].phase !== "run" && points[i].phase === "run") {
+      switchIndex = i;
+      break;
+    }
+  }
+
+  if (switchIndex < 1) {
+    return { switchJump: NaN, switchRecoverMs: NaN };
+  }
+
+  const prev = points[switchIndex - 1];
+  const current = points[switchIndex];
+  const switchJump = Math.abs(current.raw - prev.raw);
+  const recoverPoint = points
+    .slice(switchIndex)
+    .find((point) => point.raw >= 450);
+
+  return {
+    switchJump,
+    switchRecoverMs: recoverPoint ? recoverPoint.t - current.t : NaN
+  };
+}
+
+function computeRawSteadyStats(points, targetSpeed) {
+  const targetAbs = Math.abs(targetSpeed);
+  const steadyCandidates = points.filter((point) => point.raw >= targetAbs * 0.85);
+  const steadyPoints = steadyCandidates.length >= 8
+    ? steadyCandidates.slice(Math.floor(steadyCandidates.length * 0.6))
+    : points.slice(Math.max(points.length - 20, 0));
+  return computeStats(steadyPoints.map((point) => point.raw));
+}
+
+function computeRampRawStd(points, targetSpeed) {
+  const targetAbs = Math.abs(targetSpeed);
+  const rampPoints = points.filter(
+    (point) => point.raw >= targetAbs * 0.3 && point.raw <= targetAbs * 0.8
+  );
+  return computeStats(rampPoints.map((point) => point.raw)).std;
+}
+
+function buildSwitchSummary(dataset) {
+  const timeColumn = findDatasetColumn(dataset, ["time", "ms"]);
+  const rawColumn = findDatasetColumn(dataset, ["raw", "speed"]);
+  const finalColumn = findDatasetColumn(dataset, ["final", "speed"]) || findDatasetColumn(dataset, ["filtered", "speed"]);
+  const phaseColumn = findDatasetColumn(dataset, ["phase"]);
+
+  if (!timeColumn || !finalColumn || !phaseColumn) {
+    return null;
+  }
+
+  const points = dataset.rows
+    .map((row, index) => {
+      const t = row[timeColumn];
+      const finalSpeed = row[finalColumn];
+      const rawSpeed = rawColumn ? row[rawColumn] : finalSpeed;
+      const phase = row[phaseColumn];
+      if (!isFiniteNumber(t) || !isFiniteNumber(finalSpeed)) {
+        return null;
+      }
+      return {
+        index,
+        t,
+        raw: isFiniteNumber(rawSpeed) ? rawSpeed : finalSpeed,
+        final: finalSpeed,
+        phase: String(phase || "")
+      };
+    })
+    .filter(Boolean);
+
+  if (points.length < 8) {
+    return null;
+  }
+
+  const startTime = points[0].t;
+  const normalized = points.map((point) => ({
+    ...point,
+    t: point.t - startTime
+  }));
+
+  let switchIndex = -1;
+  for (let i = 1; i < normalized.length; i += 1) {
+    if (normalized[i - 1].phase !== "run" && normalized[i].phase === "run") {
+      switchIndex = i;
+      break;
+    }
+  }
+
+  if (switchIndex < 1) {
+    return null;
+  }
+
+  const switchPoint = normalized[switchIndex];
+  const prevPoint = normalized[switchIndex - 1];
+  const recoverPoint = normalized.slice(switchIndex).find((point) => Math.abs(point.final) >= 450);
+  const startupSegment = normalized.filter((point) => point.phase === "start");
+  const startupMinSpeed = startupSegment.length
+    ? Math.min(...startupSegment.map((point) => Math.min(point.raw, point.final)))
+    : Math.min(...normalized.map((point) => Math.min(point.raw, point.final)));
+  const meta = extractDatasetMeta(dataset);
+
+  return {
+    datasetLabel: buildShortDatasetLabel(dataset),
+    versionLabel: getSwitchVersionLabel(meta),
+    methodName: meta.methodName,
+    paramTag: meta.paramTag,
+    switchTimeMs: switchPoint.t,
+    preSwitchSpeed: prevPoint.final,
+    postSwitchSpeed: switchPoint.final,
+    switchJump: Math.abs(switchPoint.final - prevPoint.final),
+    recover450Ms: recoverPoint ? recoverPoint.t - switchPoint.t : NaN,
+    startupMinSpeed,
+    hasReverseSpike: startupMinSpeed < -1,
+    note: getSwitchVersionNote(meta)
+  };
+}
+
+function getSwitchVersionLabel(meta) {
+  if (meta.rawParamTag === "protect_off" || meta.methodCode === "PLL_FIX") {
+    return "原版基线";
+  }
+  if (meta.rawParamTag === "protect_on" || meta.methodCode === "PLL_SPLIT") {
+    return "改进版";
+  }
+  return "未分类";
+}
+
+function getSwitchVersionNote(meta) {
+  if (meta.rawParamTag === "protect_off") {
+    return "关闭启动切换保护，其余参数固定";
+  }
+  if (meta.rawParamTag === "protect_on") {
+    return "开启启动切换保护，其余参数固定";
+  }
+  if (meta.methodCode === "PLL_FIX") {
+    return "固定参数 PLL，对照基线";
+  }
+  if (meta.methodCode === "PLL_SPLIT") {
+    return "分程参数 + 启动保护相关改进";
+  }
+  return "请结合文件名确认";
 }
 
 function findDatasetColumn(dataset, includeKeywords, excludeKeywords = []) {
@@ -790,10 +1304,13 @@ function computeOvershoot(points, targetSpeed) {
 function extractDatasetMeta(dataset) {
   const firstRow = dataset.rows[0] || {};
   const methodCode = String(firstRow.method_name || firstRow.methodName || "未知方法");
+  const rawParamTag = String(firstRow.param_tag || firstRow.paramName || firstRow.param_tag || "无参数");
   return {
     methodCode,
     methodName: methodLabelMap[methodCode] || methodCode,
-    paramTag: String(firstRow.param_tag || firstRow.paramName || firstRow.param_tag || "无参数")
+    rawParamTag,
+    paramTag: translateParamTag(methodCode, rawParamTag),
+    shortParamTag: buildShortParamTag(methodCode, rawParamTag)
   };
 }
 
@@ -941,13 +1458,19 @@ function drawSeries(series, padding, plotWidth, plotHeight, xDomain, yDomain) {
   ctx.setLineDash(series.lineDash);
   ctx.beginPath();
 
-  series.rows.forEach((point, index) => {
+  let penDown = false;
+  series.rows.forEach((point) => {
     const x = mapValue(point.x, xDomain.min, xDomain.max, padding.left, padding.left + plotWidth);
     const y = mapValue(point.y, yDomain.min, yDomain.max, padding.top + plotHeight, padding.top);
-    if (index === 0) {
+    if (!penDown) {
       ctx.moveTo(x, y);
+      penDown = true;
     } else {
       ctx.lineTo(x, y);
+    }
+
+    if (point.breakAfter) {
+      penDown = false;
     }
   });
 
@@ -1028,7 +1551,32 @@ function getOverlayTargetSeries(seriesList) {
 
 function getLegendLabel(series) {
   if (series.axis === "y2") {
-    return "目标速度";
+    return state.analysisMode === "pll" ? "目标转速（虚线）" : "目标速度（虚线）";
+  }
+
+  const column = String(series.column || "").toLowerCase();
+  if (state.analysisMode === "pll") {
+    if (column.includes("raw") && column.includes("speed")) {
+      return `${series.datasetLabel} · 原始速度（实线）`;
+    }
+    if (column.includes("final") && column.includes("speed")) {
+      return `${series.datasetLabel} · 控制使用速度（辅助虚线）`;
+    }
+    if (column.includes("filtered") && column.includes("speed")) {
+      return `${series.datasetLabel} · 处理后速度（辅助虚线）`;
+    }
+  }
+
+  if (column.includes("raw") && column.includes("speed")) {
+    return `${series.datasetLabel} · 原始速度（虚线）`;
+  }
+
+  if (column.includes("filtered") && column.includes("speed")) {
+    return `${series.datasetLabel} · 滤波速度（实线）`;
+  }
+
+  if (column.includes("final") && column.includes("speed")) {
+    return `${series.datasetLabel} · 控制使用速度（实线）`;
   }
 
   return `${series.datasetLabel} · ${translateColumnLabel(series.column)}`;
@@ -1100,6 +1648,7 @@ function escapeHtml(value) {
 function clearAll() {
   state.datasets = [];
   state.columns = [];
+  state.analysisMode = "filter";
   state.xColumn = "";
   state.yColumn = "";
   state.y2Column = "";
@@ -1117,27 +1666,109 @@ function exportPng() {
 }
 
 function applyPresetRawFiltered() {
-  state.yColumn = findBestColumn(["raw", "speed"], []);
-  state.compareColumn = findBestColumn(["filtered", "speed"], [state.yColumn]);
-  state.y2Column = findBestColumn(["target", "ref"], [state.yColumn, state.compareColumn]);
-  state.showY2 = Boolean(state.y2Column);
+  if (state.analysisMode === "pll") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+    clearPresetRanges();
+    renderAll();
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: findBestColumn(["final", "speed"], []) || findBestColumn(["filtered", "speed"], []),
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+    clearPresetRanges();
+    renderAll();
+    return;
+  }
+
+  applyPresetColumns({
+    xColumn: findBestColumn(["time", "ms"], []),
+    yColumn: findBestColumn(["raw", "speed"], []),
+    compareColumn: findBestColumn(["filtered", "speed"], []),
+    y2Column: findBestColumn(["target", "speed"], [])
+  });
+  clearPresetRanges();
   renderAll();
 }
 
 function applyPresetFilteredTarget() {
-  state.yColumn = findBestColumn(["filtered", "speed"], []);
-  state.compareColumn = "";
-  state.y2Column = findBestColumn(["target", "ref"], [state.yColumn]);
-  state.showY2 = Boolean(state.y2Column);
+  if (state.analysisMode === "pll") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["pll", "kp"], []) || findBestColumn(["final", "speed"], []),
+      compareColumn: findBestColumn(["pll", "ki"], []),
+      y2Column: findBestColumn(["pll", "stage"], [])
+    });
+    clearPresetRanges();
+    renderAll();
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["final", "speed"], []) || findBestColumn(["filtered", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+    clearPresetRanges();
+    renderAll();
+    return;
+  }
+
+  applyPresetColumns({
+    xColumn: findBestColumn(["time", "ms"], []),
+    yColumn: findBestColumn(["filtered", "speed"], []),
+    compareColumn: "",
+    y2Column: findBestColumn(["target", "speed"], [])
+  });
+  clearPresetRanges();
   renderAll();
 }
 
 function applyPresetStartup() {
+  if (state.analysisMode === "pll") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+  } else if (state.analysisMode === "switch") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: findBestColumn(["final", "speed"], []) || findBestColumn(["filtered", "speed"], []),
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+  } else {
+  applyPresetColumns({
+    xColumn: findBestColumn(["time", "ms"], []),
+    yColumn: findBestColumn(["filtered", "speed"], []),
+    compareColumn: "",
+    y2Column: findBestColumn(["target", "speed"], [])
+  });
+  }
   if (!state.xColumn) {
     return;
   }
-  state.ranges.xMin = 0;
-  state.ranges.xMax = 500;
+  const startupWindow = inferStartupWindow();
+  if (startupWindow) {
+    state.ranges.xMin = startupWindow.xMin;
+    state.ranges.xMax = startupWindow.xMax;
+  } else {
+    state.ranges.xMin = 0;
+    state.ranges.xMax = 500;
+  }
   state.ranges.yMin = null;
   state.ranges.yMax = null;
   syncRangeInputs();
@@ -1145,6 +1776,28 @@ function applyPresetStartup() {
 }
 
 function applyPresetSteadyState() {
+  if (state.analysisMode === "pll") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+  } else if (state.analysisMode === "switch") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["final", "speed"], []) || findBestColumn(["filtered", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+  } else {
+  applyPresetColumns({
+    xColumn: findBestColumn(["time", "ms"], []),
+    yColumn: findBestColumn(["filtered", "speed"], []),
+    compareColumn: "",
+    y2Column: findBestColumn(["target", "speed"], [])
+  });
+  }
   const xDomain = inferVisibleXDomain();
   if (!xDomain) {
     return;
@@ -1159,6 +1812,58 @@ function applyPresetSteadyState() {
   renderAll();
 }
 
+function applyModeDefaults() {
+  if (state.analysisMode === "pll") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: "",
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+    clearPresetRanges();
+    return;
+  }
+
+  if (state.analysisMode === "switch") {
+    applyPresetColumns({
+      xColumn: findBestColumn(["time", "ms"], []),
+      yColumn: findBestColumn(["raw", "speed"], []),
+      compareColumn: findBestColumn(["final", "speed"], []) || findBestColumn(["filtered", "speed"], []),
+      y2Column: findBestColumn(["target", "speed"], [])
+    });
+    clearPresetRanges();
+    return;
+  }
+
+  applyPresetColumns({
+    xColumn: findBestColumn(["time", "ms"], []),
+    yColumn: findBestColumn(["filtered", "speed"], []),
+    compareColumn: "",
+    y2Column: findBestColumn(["target", "speed"], [])
+  });
+  clearPresetRanges();
+}
+
+function applyPresetColumns({ xColumn, yColumn, compareColumn, y2Column }) {
+  state.xColumn = xColumn || state.xColumn || state.columns[0] || "";
+  state.yColumn = yColumn || state.yColumn || "";
+  state.compareColumn =
+    compareColumn && compareColumn !== state.yColumn ? compareColumn : "";
+  state.y2Column =
+    y2Column && y2Column !== state.yColumn && y2Column !== state.compareColumn
+      ? y2Column
+      : "";
+  state.showY2 = Boolean(state.y2Column);
+}
+
+function clearPresetRanges() {
+  state.ranges.xMin = null;
+  state.ranges.xMax = null;
+  state.ranges.yMin = null;
+  state.ranges.yMax = null;
+  syncRangeInputs();
+}
+
 function inferVisibleXDomain() {
   const series = collectSeries();
   const xValues = series.flatMap((item) => item.rows.map((point) => point.x));
@@ -1169,6 +1874,113 @@ function inferVisibleXDomain() {
     min: Math.min(...xValues),
     max: Math.max(...xValues)
   };
+}
+
+function inferStartupWindow() {
+  const visibleDatasets = state.datasets.filter((dataset) => dataset.visible);
+  const eventXs = visibleDatasets
+    .map((dataset) => detectStartupEventX(dataset))
+    .filter((value) => Number.isFinite(value));
+
+  if (!eventXs.length) {
+    return null;
+  }
+
+  const eventX = Math.min(...eventXs);
+  const xDomain = inferVisibleXDomain();
+  if (!xDomain) {
+    return null;
+  }
+
+  const span = xDomain.max - xDomain.min;
+  const preRoll = Math.min(200, Math.max(80, span * 0.03));
+  const postRoll = Math.min(900, Math.max(450, span * 0.12));
+
+  return {
+    xMin: Math.max(xDomain.min, eventX - preRoll),
+    xMax: Math.min(xDomain.max, eventX + postRoll)
+  };
+}
+
+function detectStartupEventX(dataset) {
+  const filteredColumn = findDatasetColumn(dataset, ["filtered", "speed"], ["final"]);
+  const rawColumn = findDatasetColumn(dataset, ["raw", "speed"]);
+  const rows = buildDatasetXyRows(dataset, [filteredColumn, rawColumn]);
+
+  if (rows.length < 4) {
+    return NaN;
+  }
+
+  const baselineCount = Math.min(8, rows.length);
+  const baselineValues = rows
+    .slice(0, baselineCount)
+    .flatMap((row) => row.values)
+    .filter(isFiniteNumber);
+  const baseline = baselineValues.length
+    ? baselineValues.reduce((sum, value) => sum + value, 0) / baselineValues.length
+    : 0;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const window = rows.slice(i, i + 3);
+    if (window.length < 3) {
+      break;
+    }
+
+    const activeCount = window.reduce((count, row) => {
+      const hasActivity = row.values.some((value) => Math.abs(value - baseline) >= 8);
+      return count + (hasActivity ? 1 : 0);
+    }, 0);
+
+    if (activeCount >= 2) {
+      return rows[i].x;
+    }
+  }
+
+  const fallback = rows.find((row) =>
+    row.values.some((value) => Math.abs(value - baseline) >= 8)
+  );
+  return fallback ? fallback.x : NaN;
+}
+
+function buildDatasetXyRows(dataset, yColumns) {
+  if (!dataset.headers.includes(state.xColumn)) {
+    return [];
+  }
+
+  const validYColumns = yColumns.filter(
+    (column) => column && dataset.headers.includes(column)
+  );
+  if (!validYColumns.length) {
+    return [];
+  }
+
+  const rows = dataset.rows
+    .map((row) => {
+      const x = row[state.xColumn];
+      if (!isFiniteNumber(x)) {
+        return null;
+      }
+
+      const values = validYColumns
+        .map((column) => row[column])
+        .filter(isFiniteNumber);
+
+      if (!values.length) {
+        return null;
+      }
+
+      return { x, values };
+    })
+    .filter(Boolean);
+
+  if (state.normalizeTime && rows.length) {
+    const offset = rows[0].x;
+    rows.forEach((point) => {
+      point.x -= offset;
+    });
+  }
+
+  return rows;
 }
 
 function findBestColumn(keywords, exclude) {
@@ -1190,11 +2002,211 @@ function syncRangeInputs() {
   dom.yMaxInput.value = state.ranges.yMax ?? "";
 }
 
-function buildDatasetLabel(dataset) {
+function buildShortDatasetLabel(dataset) {
   const meta = extractDatasetMeta(dataset);
-  const methodLabel = methodLabelMap[meta.methodCode] || `${meta.methodCode}：${meta.methodName}`;
-  const paramText = meta.paramTag && meta.paramTag !== "无参数" ? `（${meta.paramTag}）` : "";
+  const methodLabel = shortMethodLabelMap[meta.methodCode] || meta.methodCode || meta.methodName;
+  const paramText =
+    meta.shortParamTag && meta.shortParamTag !== "默认"
+      ? `（${meta.shortParamTag}）`
+      : "";
   return `${methodLabel}${paramText}`;
+}
+
+function buildFullDatasetLabel(dataset) {
+  const meta = extractDatasetMeta(dataset);
+  const paramText =
+    meta.paramTag && meta.paramTag !== "默认参数"
+      ? `（${meta.paramTag}）`
+      : "";
+  return `${meta.methodName}${paramText}`;
+}
+
+function buildShortParamTag(methodCode, rawParamTag) {
+  const tag = String(rawParamTag || "").trim();
+  if (!tag || tag === "无参数" || tag === "none") {
+    return "默认";
+  }
+
+  if (methodCode === "LPF1") {
+    const match = tag.match(/^shift(\d+)$/i);
+    if (match) {
+      return `s=${match[1]}`;
+    }
+  }
+
+  if (methodCode === "MOVAVG8") {
+    const match = tag.match(/^n(\d+)$/i);
+    if (match) {
+      return `n=${match[1]}`;
+    }
+  }
+
+  if (methodCode === "WMA4") {
+    const match = tag.match(/^w([\d-]+)$/i);
+    if (match) {
+      return `w=${match[1]}`;
+    }
+  }
+
+  if (methodCode === "ADALPF") {
+    const match = tag.match(/^(\d+)to(\d+)_h(\d+)_(\d+)_n(\d+)$/i);
+    if (match) {
+      const [, fastShift, slowShift, enterRpm, exitRpm, confirmN] = match;
+      return `${fastShift}/${slowShift}, ${enterRpm}/${exitRpm}, n${confirmN}`;
+    }
+  }
+
+  if (methodCode === "PLL_FIX") {
+    const match = tag.match(/^kp(\d+)_ki(\d+)$/i);
+    if (match) {
+      return `Kp${match[1]} Ki${match[2]}`;
+    }
+  }
+
+  if (methodCode === "PLL_SPLIT") {
+    const match = tag.match(
+      /^fast(\d+)_(\d+)_slow(\d+)_(\d+)_e(\d+)x(\d+)_n(\d+)$/i
+    );
+    if (match) {
+      const [, fastKp, fastKi, slowKp, slowKi, enterRpm, exitRpm, confirmN] = match;
+      return `${fastKp}/${fastKi}->${slowKp}/${slowKi}, ${enterRpm}/${exitRpm}, n${confirmN}`;
+    }
+  }
+
+  if (tag === "protect_off") {
+    return "保护关";
+  }
+
+  if (tag === "protect_on") {
+    return "保护开";
+  }
+
+  return tag.replaceAll("_", " ");
+}
+
+function buildDatasetLabel(dataset) {
+  return buildShortDatasetLabel(dataset);
+}
+
+function renderLegendExplainBox() {
+  const visibleDatasets = state.datasets.filter((dataset) => dataset.visible);
+  if (!visibleDatasets.length) {
+    dom.legendExplainList.className = "legend-explain-list empty-state";
+    dom.legendExplainList.textContent = "导入 CSV 后，这里会显示每条方法曲线的中文说明。";
+    return;
+  }
+
+  dom.legendExplainList.className = "legend-explain-list";
+  dom.legendExplainList.innerHTML = "";
+
+  visibleDatasets.forEach((dataset) => {
+    const meta = extractDatasetMeta(dataset);
+    const card = document.createElement("div");
+    card.className = "legend-explain-card";
+
+    const top = document.createElement("div");
+    top.className = "legend-explain-top";
+
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = dataset.color;
+
+    const shortTitle = document.createElement("div");
+    shortTitle.className = "legend-explain-short";
+    shortTitle.textContent = buildShortDatasetLabel(dataset);
+
+    top.append(swatch, shortTitle);
+
+    const method = document.createElement("div");
+    method.className = "legend-explain-method";
+    method.textContent = `${meta.methodName} | 图中短标题：${buildShortDatasetLabel(dataset)}`;
+
+    const detail = document.createElement("div");
+    detail.className = "legend-explain-detail";
+    const detailLines = [`<strong>参数说明：</strong>${escapeHtml(meta.paramTag)}`];
+    if (state.analysisMode === "pll") {
+      detailLines.push("<strong>线型说明：</strong>目标转速为虚线，表示控制命令值；原始速度为实线，表示观测器/估计器直接输出。PLL 模式默认不显示滤波后速度和控制使用速度，避免把后级保护/滤波影响带进 PI 参数优劣比较。");
+    } else if (state.analysisMode === "filter") {
+      detailLines.push("<strong>线型说明：</strong>原始速度为虚线，滤波速度为实线，目标速度为虚线。");
+    }
+    if (dataset.note) {
+      detailLines.push(`<strong>备注：</strong>${escapeHtml(dataset.note)}`);
+    }
+    detail.innerHTML = detailLines.join("<br>");
+
+    const rawFile = document.createElement("div");
+    rawFile.className = "legend-explain-file";
+    rawFile.innerHTML = [
+      `<strong>原始文件：</strong>${escapeHtml(dataset.name)}`,
+      `<strong>原始参数码：</strong>${escapeHtml(meta.rawParamTag)}`
+    ].join("<br>");
+
+    card.append(top, method, detail, rawFile);
+    dom.legendExplainList.appendChild(card);
+  });
+}
+
+function translateParamTag(methodCode, rawParamTag) {
+  const tag = String(rawParamTag || "").trim();
+  if (!tag || tag === "无参数" || tag === "none") {
+    return "默认参数";
+  }
+
+  if (methodCode === "LPF1") {
+    const match = tag.match(/^shift(\d+)$/i);
+    if (match) {
+      return `低通强度 shift=${match[1]}`;
+    }
+  }
+
+  if (methodCode === "MOVAVG8") {
+    const match = tag.match(/^n(\d+)$/i);
+    if (match) {
+      return `滑动窗口 ${match[1]} 点`;
+    }
+  }
+
+  if (methodCode === "WMA4") {
+    const match = tag.match(/^w([\d-]+)$/i);
+    if (match) {
+      return `权重 ${match[1].split("-").join(":")}`;
+    }
+  }
+
+  if (methodCode === "ADALPF") {
+    const match = tag.match(/^(\d+)to(\d+)_h(\d+)_(\d+)_n(\d+)$/i);
+    if (match) {
+      const [, fastShift, slowShift, enterRpm, exitRpm, confirmN] = match;
+      return `快档shift=${fastShift}，慢档shift=${slowShift}，进入${enterRpm}rpm，退出${exitRpm}rpm，连续${confirmN}拍`;
+    }
+  }
+
+  if (methodCode === "PLL_FIX") {
+    const match = tag.match(/^kp(\d+)_ki(\d+)$/i);
+    if (match) {
+      return `固定参数 Kp=${match[1]}，Ki=${match[2]}`;
+    }
+  }
+
+  if (methodCode === "PLL_SPLIT") {
+    const match = tag.match(
+      /^fast(\d+)_(\d+)_slow(\d+)_(\d+)_e(\d+)x(\d+)_n(\d+)$/i
+    );
+    if (match) {
+      const [, fastKp, fastKi, slowKp, slowKi, enterRpm, exitRpm, confirmN] = match;
+      return `快段Kp=${fastKp} Ki=${fastKi}，慢段Kp=${slowKp} Ki=${slowKi}，门限${enterRpm}/${exitRpm}rpm，连续${confirmN}拍`;
+    }
+  }
+
+  if (tag === "protect_off") {
+    return "关闭启动切换保护，其他参数保持一致";
+  }
+
+  if (tag === "protect_on") {
+    return "开启启动切换保护，其他参数保持一致";
+  }
+
+  return tag.replaceAll("_", " ");
 }
 
 function translateColumnLabel(column) {
@@ -1204,6 +2216,10 @@ function translateColumnLabel(column) {
     raw_speed_rpm: "原始速度",
     filtered_speed_rpm: "滤波速度",
     final_speed_rpm: "控制使用速度",
+    pll_kp: "PLL 比例系数 Kp",
+    pll_ki: "PLL 积分系数 Ki",
+    pll_stage: "PLL 分程阶段",
+    pll_split_enable: "PLL 分程使能",
     sample_index: "采样序号"
   };
   return map[column] || column;
@@ -1258,11 +2274,15 @@ function renderSmallMultiples() {
       ? `rise ${formatNumber(summary.riseTimeMs)} ms | std ${formatNumber(summary.steadyStd)} rpm`
       : "指标计算中";
 
+    const legend = document.createElement("div");
+    legend.className = "mini-chart-legend";
+    buildMiniLegendItems(datasetSeries).forEach((item) => legend.appendChild(item));
+
     const miniCanvas = document.createElement("canvas");
     miniCanvas.width = 420;
     miniCanvas.height = 260;
 
-    card.append(title, sub, badge, miniCanvas);
+    card.append(title, sub, badge, legend, miniCanvas);
     dom.smallMultiplesGrid.appendChild(card);
     drawMiniChart(miniCanvas, datasetSeries);
   });
@@ -1296,13 +2316,18 @@ function drawMiniChart(canvas, seriesGroup) {
     miniCtx.lineWidth = series.axis === "y2" ? 1.8 : 2.4;
     miniCtx.setLineDash(series.lineDash);
     miniCtx.beginPath();
-    series.rows.forEach((point, index) => {
+    let penDown = false;
+    series.rows.forEach((point) => {
       const x = mapValue(point.x, xDomain.min, xDomain.max, padding.left, padding.left + plotWidth);
       const y = mapValue(point.y, yDomain.min, yDomain.max, padding.top + plotHeight, padding.top);
-      if (index === 0) {
+      if (!penDown) {
         miniCtx.moveTo(x, y);
+        penDown = true;
       } else {
         miniCtx.lineTo(x, y);
+      }
+      if (point.breakAfter) {
+        penDown = false;
       }
     });
     miniCtx.stroke();
@@ -1314,6 +2339,44 @@ function drawMiniChart(canvas, seriesGroup) {
   miniCtx.textAlign = "left";
   miniCtx.fillText(`max ${formatNumber(Math.max(...yValues))}`, 12, 18);
   miniCtx.fillText(`min ${formatNumber(Math.min(...yValues))}`, 12, height - 10);
+}
+
+function buildMiniLegendItems(seriesGroup) {
+  return seriesGroup.map((series) => {
+    const item = document.createElement("div");
+    item.className = "mini-chart-legend-item";
+    item.style.color = series.axis === "y2" ? withAlpha(series.color, 0.72) : series.color;
+
+    const line = document.createElement("span");
+    line.className = "mini-chart-legend-line";
+    if (series.lineDash.length) {
+      line.style.borderTopStyle = "dashed";
+    }
+
+    const text = document.createElement("span");
+    text.textContent = getMiniLegendLabel(series);
+
+    item.append(line, text);
+    return item;
+  });
+}
+
+function getMiniLegendLabel(series) {
+  if (series.axis === "y2") {
+    return "目标转速";
+  }
+
+  const column = String(series.column || "").toLowerCase();
+  if (column.includes("raw") && column.includes("speed")) {
+    return "原始速度";
+  }
+  if (column.includes("final") && column.includes("speed")) {
+    return state.analysisMode === "pll" ? "控制使用速度（辅助）" : "控制使用速度";
+  }
+  if (column.includes("filtered") && column.includes("speed")) {
+    return state.analysisMode === "pll" ? "处理后速度（辅助）" : "滤波速度";
+  }
+  return translateColumnLabel(series.column);
 }
 
 function groupSeriesByDataset(seriesList) {

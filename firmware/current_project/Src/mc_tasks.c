@@ -44,40 +44,39 @@ extern UART_HandleTypeDef huart2;
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN Private define */
-/* 这里分成两种实验模式：
-   1) ADALPF 参数批量寻优：一次自动跑 8~10 组阶跃响应
-   2) 常规滤波对比：保留 500 -> 1000 -> 500 的调速实验 */
-#define MC_EXPERIMENT_ENABLE_TUNING_BATCH    1U
+/* 现场演示就改这一个参数。
+   1) 滤波方法对比：其他东西都固定，只看滤波差异
+   2) PLL 参数对比：滤波固定，不把别的因素掺进来
+   3) 切换保护对比：滤波和 PLL 都固定，只看保护开关前后 */
+#define MC_DEMO_MODE_FILTER_COMPARE          1U
+#define MC_DEMO_MODE_PLL_COMPARE             2U
+#define MC_DEMO_MODE_SWITCH_COMPARE          3U
+#define MC_DEMO_MODE                         MC_DEMO_MODE_FILTER_COMPARE
 
-#if (MC_EXPERIMENT_ENABLE_TUNING_BATCH != 0U)
-#define MC_EXPERIMENT_SERIES_NAME           "adalpf_tuning_batch"
-#define MC_EXPERIMENT_BASE_SPEED_RPM        ((int16_t)500)
-#define MC_EXPERIMENT_BOOST_SPEED_RPM       ((int16_t)1000)
-#define MC_EXPERIMENT_SPEED_HOLD_MS         ((uint16_t)6000)
-#define MC_EXPERIMENT_RAMP_TIME_MS          ((uint16_t)1200)
-#define MC_EXPERIMENT_SAMPLE_PERIOD_MS      ((uint16_t)20)
-#define MC_EXPERIMENT_STOP_CAPTURE_MS       ((uint16_t)1200)
-#define MC_EXPERIMENT_STOP_SETTLE_MS        ((uint16_t)2200)
-#define MC_EXPERIMENT_TOTAL_RUN_MS          ((uint16_t)6000)
-#define MC_EXPERIMENT_START_TIMEOUT_MS      ((uint16_t)2500)
-#else
-/* 下面这些参数是为了做课程实验时方便快速连测
-   这里改成 500 -> 1000 -> 500 的节拍，方便看启动、加速、减速和停转 */
-#define MC_EXPERIMENT_SERIES_NAME           "speed_filter_suite"
-#define MC_EXPERIMENT_BASE_SPEED_RPM        ((int16_t)500)
-#define MC_EXPERIMENT_BOOST_SPEED_RPM       ((int16_t)1000)
-#define MC_EXPERIMENT_SPEED_HOLD_MS         ((uint16_t)6000)
-#define MC_EXPERIMENT_RAMP_TIME_MS          ((uint16_t)1200)
-#define MC_EXPERIMENT_SAMPLE_PERIOD_MS      ((uint16_t)20)
-#define MC_EXPERIMENT_STOP_CAPTURE_MS       ((uint16_t)1200)
-#define MC_EXPERIMENT_STOP_SETTLE_MS        ((uint16_t)2200)
-#define MC_EXPERIMENT_TOTAL_RUN_MS          ((uint16_t)18000)
-#define MC_EXPERIMENT_START_TIMEOUT_MS      ((uint16_t)2500)
-#endif
-#define MC_EXPERIMENT_TX_BUFFER_SIZE        192U
+/* 滤波演示时，是否顺带启用启动切换保护。
+   默认关掉，保证“滤波对比”尽量干净；如果你想现场演示“同一批滤波器 + 开保护”，
+   就把这里改成 1U，不用去每个配置项里逐个改。 */
+#define MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE 0U
+
+#define MC_EXPERIMENT_BASE_SPEED_RPM         ((int16_t)500)
+#define MC_EXPERIMENT_BOOST_SPEED_RPM        ((int16_t)1000)
+#define MC_EXPERIMENT_SPEED_HOLD_MS          ((uint16_t)6000)
+#define MC_EXPERIMENT_RAMP_TIME_MS           ((uint16_t)1200)
+#define MC_EXPERIMENT_SAMPLE_PERIOD_MS       ((uint16_t)20)
+#define MC_EXPERIMENT_STOP_CAPTURE_MS        ((uint16_t)1200)
+#define MC_EXPERIMENT_STOP_SETTLE_MS         ((uint16_t)2200)
+#define MC_EXPERIMENT_TOTAL_RUN_MS           ((uint16_t)18000)
+#define MC_EXPERIMENT_START_TIMEOUT_MS       ((uint16_t)2500)
+#define MC_EXPERIMENT_INTER_SESSION_WAIT_MS  ((uint16_t)1000)
+
+#define MC_STARTUP_SWITCH_MIN_SPEED_RPM      ((int16_t)120)
+#define MC_STARTUP_SWITCH_STABLE_MS          ((uint16_t)120)
+#define MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES  ((uint16_t)5)
+
+#define MC_EXPERIMENT_TX_BUFFER_SIZE         256U
 #define MC_EXPERIMENT_QUEUE_DEPTH           96U
 #define MC_EXPERIMENT_METHOD_NAME_LEN       20U
-#define MC_EXPERIMENT_PARAM_NAME_LEN        20U
+#define MC_EXPERIMENT_PARAM_NAME_LEN        40U
 #define MC_SPEED_FILTER_MOVAVG_DEPTH        8U
 #define MC_SPEED_FILTER_WMA_DEPTH           4U
 #define MC_SPEED_FILTER_ADAPTIVE_FAST_SHIFT 2U
@@ -142,6 +141,18 @@ static int16_t g_mcAdaptiveExitRpm = MC_SPEED_FILTER_ADAPTIVE_EXIT_RPM;
 static uint16_t g_mcAdaptiveConfirmN = MC_SPEED_FILTER_ADAPTIVE_CONFIRM_N;
 static uint8_t g_mcAdaptiveCurrentShift = MC_SPEED_FILTER_ADAPTIVE_FAST_SHIFT;
 static uint16_t g_mcAdaptiveSteadyCounter = 0U;
+static uint8_t g_mcPllSplitEnable = 0U;
+static int16_t g_mcPllFastKp = PLL_KP_GAIN;
+static int16_t g_mcPllFastKi = PLL_KI_GAIN;
+static int16_t g_mcPllSlowKp = PLL_KP_GAIN;
+static int16_t g_mcPllSlowKi = PLL_KI_GAIN;
+static int16_t g_mcPllSplitEnterRpm = 0;
+static int16_t g_mcPllSplitExitRpm = 0;
+static uint16_t g_mcPllSplitConfirmN = 0U;
+static uint8_t g_mcPllCurrentStage = 0U;
+static uint16_t g_mcPllStableCounter = 0U;
+static int16_t g_mcPllActiveKp = PLL_KP_GAIN;
+static int16_t g_mcPllActiveKi = PLL_KI_GAIN;
 
 typedef struct
 {
@@ -154,6 +165,15 @@ typedef struct
   int16_t adaptiveEnterRpm;
   int16_t adaptiveExitRpm;
   uint16_t adaptiveConfirmN;
+  uint8_t pllSplitEnable;
+  int16_t pllFastKp;
+  int16_t pllFastKi;
+  int16_t pllSlowKp;
+  int16_t pllSlowKi;
+  int16_t pllSplitEnterRpm;
+  int16_t pllSplitExitRpm;
+  uint16_t pllSplitConfirmN;
+  uint8_t startupProtectEnable;
 } MC_ExperimentConfig_t;
 
 typedef struct
@@ -166,6 +186,10 @@ typedef struct
   int16_t rawSpeedRpm;
   int16_t filteredSpeedRpm;
   int16_t finalSpeedRpm;
+  int16_t pllKp;
+  int16_t pllKi;
+  uint8_t pllStage;
+  uint8_t pllSplitEnable;
   uint8_t phase;
   uint8_t stopReason;
   char methodName[MC_EXPERIMENT_METHOD_NAME_LEN];
@@ -187,31 +211,41 @@ typedef enum
   MC_EXPERIMENT_STOP_BY_FAULT = 1
 } MC_ExperimentStopReason_t;
 
-static const MC_ExperimentConfig_t g_mcExperimentConfigs[] =
+/* 这一组是给老师现场演示“滤波方法对比”用的。
+   PLL 固定住；启动保护默认跟着总宏走，平时建议先关掉，这样更容易把滤波差异单独讲清楚。 */
+static const MC_ExperimentConfig_t g_mcFilterCompareConfigs[] =
 {
-#if (MC_EXPERIMENT_ENABLE_TUNING_BATCH != 0U)
-  /* 这批先只做自适应低通参数寻优，避免一次同时比较太多方法 */
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h12_40_n32", 2U, 4U, 12, 40, 32U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h12_40_n64", 2U, 4U, 12, 40, 64U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h12_40_n96", 2U, 4U, 12, 40, 96U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h18_40_n32", 2U, 4U, 18, 40, 32U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h18_40_n64", 2U, 4U, 18, 40, 64U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h18_40_n96", 2U, 4U, 18, 40, 96U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h24_40_n32", 2U, 4U, 24, 40, 32U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h24_40_n64", 2U, 4U, 24, 40, 64U},
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h24_40_n96", 2U, 4U, 24, 40, 96U}
-#else
-  {MC_SPEED_FILTER_NONE,       3U, "NONE",      "none",         2U, 4U, 18, 40, 64U},
-  {MC_SPEED_FILTER_LPF1,       2U, "LPF1",      "shift2",       2U, 4U, 18, 40, 64U},
-  {MC_SPEED_FILTER_LPF1,       3U, "LPF1",      "shift3",       2U, 4U, 18, 40, 64U},
-  {MC_SPEED_FILTER_LPF1,       4U, "LPF1",      "shift4",       2U, 4U, 18, 40, 64U},
-  {MC_SPEED_FILTER_MOVING_AVG, 3U, "MOVAVG8",   "n8",           2U, 4U, 18, 40, 64U},
-  /* w1-2-3-4 表示最近 4 个点的权重分别是 1,2,3,4 */
-  {MC_SPEED_FILTER_WEIGHTED_MOVING_AVG, 3U, "WMA4", "w1-2-3-4", 2U, 4U, 18, 40, 64U},
-  /* 2to4_h18_40_n64 表示 shift2/4，带 18/40rpm 滞回和连续判稳 */
-  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF",  "2to4_h18_40_n64", 2U, 4U, 18, 40, 64U}
-#endif
+  {MC_SPEED_FILTER_NONE,       3U, "NONE",    "none",              2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_LPF1,       2U, "LPF1",    "shift2",            2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_LPF1,       3U, "LPF1",    "shift3",            2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_LPF1,       4U, "LPF1",    "shift4",            2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_MOVING_AVG, 3U, "MOVAVG8", "n8",                2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_WEIGHTED_MOVING_AVG, 3U, "WMA4", "w1-2-3-4",    2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE},
+  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "2to4_h18_40_n64",  2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, MC_FILTER_COMPARE_STARTUP_PROTECT_ENABLE}
 };
+
+/* 这一组专门看 PLL 估计器自身。
+   所以滤波固定成 NONE，启动保护也先关掉，避免把别的改进一起算进去。 */
+static const MC_ExperimentConfig_t g_mcPllCompareConfigs[] =
+{
+  {MC_SPEED_FILTER_NONE, 3U, "PLL_FIX",   "kp165_ki4",                       2U, 4U, 18, 40, 64U, 0U, 165, 4, 165, 4, 18, 40, 64U, 0U},
+  {MC_SPEED_FILTER_NONE, 3U, "PLL_SPLIT", "fast245_5_slow165_3_e17x38_n32", 2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, 0U},
+  {MC_SPEED_FILTER_NONE, 3U, "PLL_SPLIT", "fast245_5_slow170_3_e18x40_n32", 2U, 4U, 18, 40, 64U, 1U, 245, 5, 170, 3, 18, 40, 32U, 0U},
+  {MC_SPEED_FILTER_NONE, 3U, "PLL_SPLIT", "fast245_5_slow165_4_e18x40_n32", 2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 4, 18, 40, 32U, 0U},
+  {MC_SPEED_FILTER_NONE, 3U, "PLL_SPLIT", "fast250_5_slow165_3_e18x40_n32", 2U, 4U, 18, 40, 64U, 1U, 250, 5, 165, 3, 18, 40, 32U, 0U}
+};
+
+/* 这一组就是给“有无切换保护”现场演示用的。
+   两组除了 startupProtectEnable 以外都一样，这样老师一眼就能明白在比什么。 */
+static const MC_ExperimentConfig_t g_mcSwitchCompareConfigs[] =
+{
+  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "protect_off", 2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, 0U},
+  {MC_SPEED_FILTER_ADAPTIVE_LPF, 3U, "ADALPF", "protect_on",  2U, 4U, 18, 40, 64U, 1U, 245, 5, 165, 3, 17, 38, 32U, 1U}
+};
+
+static uint8_t g_mcStartupProtectEnable = 1U;
+static uint32_t g_mcStartupSwitchStableTick = 0U;
+static uint16_t g_mcStartupEstimateConfirmCounter = 0U;
 
 static uint8_t g_mcExperimentConfigIndex = 0U;
 static uint16_t g_mcExperimentSessionId = 0U;
@@ -228,6 +262,8 @@ static uint8_t g_mcExperimentTextModeEnabled = 0U;
 static uint8_t g_mcExperimentAutoStopIssued = 0U;
 static uint8_t g_mcExperimentBoostIssued = 0U;
 static uint8_t g_mcExperimentReturnIssued = 0U;
+static uint8_t g_mcExperimentAutoBatchArmed = 0U;
+static uint32_t g_mcExperimentNextStartTick = 0U;
 static MC_ExperimentSample_t g_mcExperimentQueue[MC_EXPERIMENT_QUEUE_DEPTH];
 static volatile uint16_t g_mcExperimentQueueWrite = 0U;
 static volatile uint16_t g_mcExperimentQueueRead = 0U;
@@ -253,8 +289,14 @@ static void MC_SPEED_FilterReset(void);
 static void MC_SPEED_FilterInitFromSensor(const SpeednPosFdbk_Handle_t *pSource);
 static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource, int16_t rawSpeedUnit);
 static void MC_SPEED_FilterSyncInstantaneousState(const SpeednPosFdbk_Handle_t *pSource);
+static void MC_PLL_TuningReset(void);
+static void MC_PLL_TuningApply(const MC_ExperimentConfig_t *pConfig);
+static void MC_PLL_TuningUpdate(void);
 
 /* USER CODE BEGIN Private Functions */
+static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetConfigTable(void);
+static uint8_t MC_EXPERIMENT_GetConfigCount(void);
+static const char *MC_EXPERIMENT_GetSeriesName(void);
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetCurrentConfig(void);
 static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig);
 static void MC_EXPERIMENT_StartSequence(void);
@@ -276,6 +318,7 @@ static const char *MC_EXPERIMENT_StopReasonName(uint8_t stopReason);
 static uint8_t MC_EXPERIMENT_IsStartAllowed(void);
 static uint8_t MC_EXPERIMENT_IsStopFinished(MCI_State_t motorState);
 static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState);
+static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed);
 
 /* USER CODE END Private Functions */
 /**
@@ -531,6 +574,7 @@ __weak void TSK_MediumFrequencyTaskM1(void)
 
   bool IsSpeedReliable = STO_PLL_CalcAvrgMecSpeedUnit(&STO_PLL_M1, &wAux);
   MC_SPEED_FilterUpdateMecSpeed(&STO_PLL_M1._Super, wAux);
+  MC_PLL_TuningUpdate();
   PQD_CalcElMotorPower(pMPM[M1]);
 
   if (MCI_GetCurrentFaults(&Mci[M1]) == MC_NO_FAULTS)
@@ -696,8 +740,9 @@ __weak void TSK_MediumFrequencyTaskM1(void)
           }
           else
           {
-            bool LoopClosed;
-            int16_t hForcedMecSpeedUnit;
+              bool LoopClosed;
+              uint8_t SwitchReady;
+              int16_t hForcedMecSpeedUnit;
 
             if(! RUC_Exec(&RevUpControlM1))
 
@@ -717,9 +762,13 @@ __weak void TSK_MediumFrequencyTaskM1(void)
               tempBool = VSS_TransitionEnded(&VirtualSpeedSensorM1);
               LoopClosed = LoopClosed || tempBool;
 
-              /* If any of the above conditions is true, the loop is considered closed.
-                 The state machine transitions to the START_RUN state. */
-              if (true ==  LoopClosed)
+              /* 原版这里基本上是“看起来能闭环了就切过去”。
+                 我们这里多包一层判断：
+                 1. 如果演示的是无保护基线，就直接放行；
+                 2. 如果开了保护，就要求速度先过最小门限，并且连续稳定一小段时间。 */
+              SwitchReady = MC_STARTUP_IsSwitchReady((uint8_t)((true == LoopClosed) ? 1U : 0U));
+
+              if (SwitchReady != 0U)
               {
                 #if ( PID_SPEED_INTEGRAL_INIT_DIV == 0 )
                 PID_SetIntegralTerm(&PIDSpeedHandle_M1, 0);
@@ -732,6 +781,8 @@ __weak void TSK_MediumFrequencyTaskM1(void)
               /* USER CODE BEGIN MediumFrequencyTask M1 1 */
 
               /* USER CODE END MediumFrequencyTask M1 1 */
+                /* 这里就是我们这次课设真正接管速度环的位置。
+                   前面做的滤波、PLL 调整、启动保护，最后都会体现在这个速度反馈源上。 */
                 STC_SetSpeedSensor(pSTC[M1], &SpeedFilterSensorM1); /* Filtered observer speed */
                 FOC_InitAdditionalMethods(M1);
                 FOC_CalcCurrRef( M1 );
@@ -1457,9 +1508,50 @@ int16_t MC_SPEED_GetFilteredSpeedRpm(void)
 }
 /* USER CODE BEGIN mc_task 0 */
 
+static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetConfigTable(void)
+{
+#if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
+  return g_mcPllCompareConfigs;
+#elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
+  return g_mcSwitchCompareConfigs;
+#else
+  return g_mcFilterCompareConfigs;
+#endif
+}
+
+static uint8_t MC_EXPERIMENT_GetConfigCount(void)
+{
+#if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
+  return (uint8_t)(sizeof(g_mcPllCompareConfigs) / sizeof(g_mcPllCompareConfigs[0]));
+#elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
+  return (uint8_t)(sizeof(g_mcSwitchCompareConfigs) / sizeof(g_mcSwitchCompareConfigs[0]));
+#else
+  return (uint8_t)(sizeof(g_mcFilterCompareConfigs) / sizeof(g_mcFilterCompareConfigs[0]));
+#endif
+}
+
+static const char *MC_EXPERIMENT_GetSeriesName(void)
+{
+#if (MC_DEMO_MODE == MC_DEMO_MODE_PLL_COMPARE)
+  return "pll_compare_demo";
+#elif (MC_DEMO_MODE == MC_DEMO_MODE_SWITCH_COMPARE)
+  return "switch_compare_demo";
+#else
+  return "filter_compare_demo";
+#endif
+}
+
 static const MC_ExperimentConfig_t *MC_EXPERIMENT_GetCurrentConfig(void)
 {
-  return &g_mcExperimentConfigs[g_mcExperimentConfigIndex];
+  const MC_ExperimentConfig_t *pTable = MC_EXPERIMENT_GetConfigTable();
+  uint8_t configCount = MC_EXPERIMENT_GetConfigCount();
+
+  if (g_mcExperimentConfigIndex >= configCount)
+  {
+    g_mcExperimentConfigIndex = 0U;
+  }
+
+  return &pTable[g_mcExperimentConfigIndex];
 }
 
 static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig)
@@ -1476,6 +1568,10 @@ static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig)
   g_mcAdaptiveEnterRpm = pConfig->adaptiveEnterRpm;
   g_mcAdaptiveExitRpm = pConfig->adaptiveExitRpm;
   g_mcAdaptiveConfirmN = pConfig->adaptiveConfirmN;
+  g_mcStartupProtectEnable = pConfig->startupProtectEnable;
+  g_mcStartupSwitchStableTick = 0U;
+  g_mcStartupEstimateConfirmCounter = 0U;
+  MC_PLL_TuningApply(pConfig);
 }
 
 static void MC_EXPERIMENT_StartSequence(void)
@@ -1506,6 +1602,8 @@ static void MC_EXPERIMENT_StartSequence(void)
   g_mcExperimentPhase = MC_EXPERIMENT_PHASE_START;
   g_mcExperimentTextModeEnabled = 1U;
   g_mcExperimentAutoStopIssued = 0U;
+  g_mcExperimentAutoBatchArmed = 1U;
+  g_mcExperimentNextStartTick = 0U;
 
   MC_EXPERIMENT_PushMetaFrame(MC_EXPERIMENT_PHASE_START, MC_EXPERIMENT_STOP_BY_USER);
 }
@@ -1573,6 +1671,10 @@ static void MC_EXPERIMENT_PushSample(uint8_t phase, uint8_t stopReason)
   sample.rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
   sample.filteredSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
   sample.finalSpeedRpm = (int16_t)MC_GetAverageMecSpeedMotor1_F();
+  sample.pllKp = g_mcPllActiveKp;
+  sample.pllKi = g_mcPllActiveKi;
+  sample.pllStage = g_mcPllCurrentStage;
+  sample.pllSplitEnable = g_mcPllSplitEnable;
   sample.phase = phase;
   sample.stopReason = stopReason;
   (void)snprintf(sample.methodName, sizeof(sample.methodName), "%s", pConfig->methodName);
@@ -1597,6 +1699,10 @@ static void MC_EXPERIMENT_PushMetaFrame(uint8_t phase, uint8_t stopReason)
   sample.sampleIndex = 0U;
   sample.timeMs = MC_EXPERIMENT_GetElapsedMs();
   sample.targetSpeedRpm = (int16_t)MC_GetMecSpeedReferenceMotor1_F();
+  sample.pllKp = g_mcPllActiveKp;
+  sample.pllKi = g_mcPllActiveKi;
+  sample.pllStage = g_mcPllCurrentStage;
+  sample.pllSplitEnable = g_mcPllSplitEnable;
   sample.phase = phase;
   sample.stopReason = stopReason;
   (void)snprintf(sample.methodName, sizeof(sample.methodName), "%s", pConfig->methodName);
@@ -1661,7 +1767,7 @@ static void MC_EXPERIMENT_SendTextIfPossible(void)
   {
     int length = snprintf(g_mcExperimentTxBuffer,
                           sizeof(g_mcExperimentTxBuffer),
-                          "time_ms,target_speed_rpm,raw_speed_rpm,filtered_speed_rpm,final_speed_rpm,session_id,config_index,method_name,param_tag,phase,stop_reason,sample_index\r\n");
+                          "time_ms,target_speed_rpm,raw_speed_rpm,filtered_speed_rpm,final_speed_rpm,pll_kp,pll_ki,pll_stage,pll_split_enable,session_id,config_index,method_name,param_tag,phase,stop_reason,sample_index\r\n");
     g_mcExperimentHeaderPending = 0U;
     if (length > 0)
     {
@@ -1688,12 +1794,16 @@ static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, ch
 
   (void)snprintf(pBuffer,
                  bufferSize,
-                 "%lu,%d,%d,%d,%d,%u,%u,%s,%s,%s,%s,%lu\r\n",
+                 "%lu,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%s,%s,%s,%s,%lu\r\n",
                  (unsigned long)pSample->timeMs,
                  pSample->targetSpeedRpm,
                  pSample->rawSpeedRpm,
                  pSample->filteredSpeedRpm,
                  pSample->finalSpeedRpm,
+                 pSample->pllKp,
+                 pSample->pllKi,
+                 pSample->pllStage,
+                 pSample->pllSplitEnable,
                  pSample->sessionId,
                  pSample->configIndex,
                  pSample->methodName,
@@ -1803,6 +1913,12 @@ static uint8_t MC_EXPERIMENT_IsStartAllowed(void)
     return 0U;
   }
 
+  if ((g_mcExperimentAutoBatchArmed != 0U) &&
+      (HAL_GetTick() < g_mcExperimentNextStartTick))
+  {
+    return 0U;
+  }
+
   if (g_mcExperimentAdvanceConfigPending != 0U)
   {
     return 0U;
@@ -1874,6 +1990,7 @@ static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState)
   g_mcExperimentAutoStopIssued = 0U;
   g_mcExperimentBoostIssued = 0U;
   g_mcExperimentReturnIssued = 0U;
+  g_mcExperimentAutoBatchArmed = 0U;
 }
 
 void MC_EXPERIMENT_BackgroundTask(void)
@@ -1884,20 +2001,26 @@ void MC_EXPERIMENT_BackgroundTask(void)
       (MC_EXPERIMENT_IsQueueEmpty() != 0U))
   {
     uint8_t nextConfigIndex = g_mcExperimentConfigIndex;
+    uint8_t shouldAutoStart = 0U;
     int length = snprintf(g_mcExperimentTxBuffer,
                           sizeof(g_mcExperimentTxBuffer),
                           "#session_end,%u,%u,%s,%s\r\n",
                           g_mcExperimentSessionId,
                           g_mcExperimentConfigIndex,
                           MC_EXPERIMENT_StopReasonName(g_mcExperimentStopReason),
-                          MC_EXPERIMENT_SERIES_NAME);
+                          MC_EXPERIMENT_GetSeriesName());
 
     if (g_mcExperimentAdvanceConfigPending != 0U)
     {
       nextConfigIndex++;
-      if (nextConfigIndex >= (sizeof(g_mcExperimentConfigs) / sizeof(g_mcExperimentConfigs[0])))
+      if (nextConfigIndex >= MC_EXPERIMENT_GetConfigCount())
       {
-        nextConfigIndex = 0U;
+        nextConfigIndex = g_mcExperimentConfigIndex;
+        shouldAutoStart = 0U;
+      }
+      else
+      {
+        shouldAutoStart = 1U;
       }
     }
 
@@ -1909,12 +2032,33 @@ void MC_EXPERIMENT_BackgroundTask(void)
     g_mcExperimentAutoStopIssued = 0U;
     g_mcExperimentBoostIssued = 0U;
     g_mcExperimentReturnIssued = 0U;
+    /* 最后一组跑完后必须明确撤掉自动连跑标志，
+       否则会在 cfg 保持不变时重复启动最后一组。 */
+    g_mcExperimentAutoBatchArmed = 0U;
+    g_mcExperimentNextStartTick = 0U;
     g_mcExperimentConfigIndex = nextConfigIndex;
+    if (shouldAutoStart != 0U)
+    {
+      g_mcExperimentAutoBatchArmed = 1U;
+      g_mcExperimentNextStartTick = HAL_GetTick() + MC_EXPERIMENT_INTER_SESSION_WAIT_MS;
+    }
 
     if (length > 0)
     {
       (void)HAL_UART_Transmit(&huart2, (uint8_t *)g_mcExperimentTxBuffer, (uint16_t)length, 100U);
     }
+  }
+
+  if ((g_mcExperimentAutoBatchArmed != 0U) &&
+      (g_mcExperimentPhase == MC_EXPERIMENT_PHASE_IDLE) &&
+      (g_mcExperimentTextModeEnabled == 0U) &&
+      (g_mcExperimentFooterPending == 0U) &&
+      (g_mcExperimentAdvanceConfigPending == 0U) &&
+      (MC_GetSTMStateMotor1() == IDLE) &&
+      (HAL_GetTick() >= g_mcExperimentNextStartTick))
+  {
+    g_mcExperimentAutoBatchArmed = 0U;
+    MC_EXPERIMENT_StartSequence();
   }
 }
 
@@ -1950,6 +2094,166 @@ static void MC_EXPERIMENT_UpdateSpeedProfile(void)
   {
     MC_EXPERIMENT_RequestStop(MC_EXPERIMENT_STOP_BY_USER);
   }
+}
+
+static void MC_PLL_TuningReset(void)
+{
+  g_mcPllCurrentStage = 0U;
+  g_mcPllStableCounter = 0U;
+  g_mcPllActiveKp = g_mcPllFastKp;
+  g_mcPllActiveKi = g_mcPllFastKi;
+  STO_SetPLLGains(&STO_PLL_M1, g_mcPllActiveKp, g_mcPllActiveKi);
+  STO_ResetPLL(&STO_PLL_M1);
+}
+
+static void MC_PLL_TuningApply(const MC_ExperimentConfig_t *pConfig)
+{
+  if (pConfig == MC_NULL)
+  {
+    return;
+  }
+
+  g_mcPllSplitEnable = pConfig->pllSplitEnable;
+  g_mcPllFastKp = pConfig->pllFastKp;
+  g_mcPllFastKi = pConfig->pllFastKi;
+  g_mcPllSlowKp = pConfig->pllSlowKp;
+  g_mcPllSlowKi = pConfig->pllSlowKi;
+  g_mcPllSplitEnterRpm = pConfig->pllSplitEnterRpm;
+  g_mcPllSplitExitRpm = pConfig->pllSplitExitRpm;
+  g_mcPllSplitConfirmN = pConfig->pllSplitConfirmN;
+  MC_PLL_TuningReset();
+}
+
+static void MC_PLL_TuningUpdate(void)
+{
+  int16_t absSpeedRpm;
+  uint8_t nextStage;
+
+  if (g_mcPllSplitEnable == 0U)
+  {
+    return;
+  }
+
+  absSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
+  if (absSpeedRpm < 0)
+  {
+    absSpeedRpm = (int16_t)(-absSpeedRpm);
+  }
+
+  nextStage = g_mcPllCurrentStage;
+
+  if (g_mcPllCurrentStage == 0U)
+  {
+    if (absSpeedRpm >= g_mcPllSplitEnterRpm)
+    {
+      if (g_mcPllStableCounter < g_mcPllSplitConfirmN)
+      {
+        g_mcPllStableCounter++;
+      }
+      if (g_mcPllStableCounter >= g_mcPllSplitConfirmN)
+      {
+        nextStage = 1U;
+      }
+    }
+    else
+    {
+      g_mcPllStableCounter = 0U;
+    }
+  }
+  else
+  {
+    if (absSpeedRpm <= g_mcPllSplitExitRpm)
+    {
+      if (g_mcPllStableCounter < g_mcPllSplitConfirmN)
+      {
+        g_mcPllStableCounter++;
+      }
+      if (g_mcPllStableCounter >= g_mcPllSplitConfirmN)
+      {
+        nextStage = 0U;
+      }
+    }
+    else
+    {
+      g_mcPllStableCounter = 0U;
+    }
+  }
+
+  if (nextStage != g_mcPllCurrentStage)
+  {
+    g_mcPllCurrentStage = nextStage;
+    g_mcPllStableCounter = 0U;
+    if (g_mcPllCurrentStage == 0U)
+    {
+      g_mcPllActiveKp = g_mcPllFastKp;
+      g_mcPllActiveKi = g_mcPllFastKi;
+    }
+    else
+    {
+      g_mcPllActiveKp = g_mcPllSlowKp;
+      g_mcPllActiveKi = g_mcPllSlowKi;
+    }
+    STO_SetPLLGains(&STO_PLL_M1, g_mcPllActiveKp, g_mcPllActiveKi);
+  }
+}
+
+static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
+{
+  int16_t filteredSpeedRpm;
+  int16_t rawSpeedRpm;
+  uint32_t nowTick;
+
+  if (loopClosed == 0U)
+  {
+    g_mcStartupSwitchStableTick = 0U;
+    g_mcStartupEstimateConfirmCounter = 0U;
+    return 0U;
+  }
+
+  if (g_mcStartupProtectEnable == 0U)
+  {
+    return 1U;
+  }
+
+  filteredSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
+  if (filteredSpeedRpm < MC_STARTUP_SWITCH_MIN_SPEED_RPM)
+  {
+    g_mcStartupSwitchStableTick = 0U;
+    g_mcStartupEstimateConfirmCounter = 0U;
+    return 0U;
+  }
+
+  rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
+  if (rawSpeedRpm < 0)
+  {
+    g_mcStartupSwitchStableTick = 0U;
+    g_mcStartupEstimateConfirmCounter = 0U;
+    return 0U;
+  }
+
+  if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
+  {
+    g_mcStartupEstimateConfirmCounter++;
+  }
+
+  if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
+  {
+    return 0U;
+  }
+
+  nowTick = HAL_GetTick();
+  if (g_mcStartupSwitchStableTick == 0U)
+  {
+    g_mcStartupSwitchStableTick = nowTick;
+    return 0U;
+  }
+
+  if ((nowTick - g_mcStartupSwitchStableTick) < (uint32_t)MC_STARTUP_SWITCH_STABLE_MS)
+  {
+    return 0U;
+  }
+
+  return 1U;
 }
 
 /* USER CODE END mc_task 0 */

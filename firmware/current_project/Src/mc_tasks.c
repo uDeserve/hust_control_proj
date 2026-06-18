@@ -1502,24 +1502,55 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
   int32_t filtered = rawSpeedUnit;
   int16_t targetSpeedUnit = (int16_t)MC_GetMecSpeedReferenceMotor1();
 
+  /* 先说明原版逻辑：
+     原版 MCSDK 在这里并没有我们这层“速度滤波入口”。
+     速度环用的是 STO_PLL_M1._Super 里直接给出的估计速度，估计器算出多少，速度环就直接吃多少。
+
+     现版逻辑：
+     我们额外拷贝了一个 SpeedFilterSensorM1 句柄，并把它交给 STC_Init(...)。
+     所以这里的职责就变成了：
+     1. 先拿到 STO+PLL 的原始估计速度 rawSpeedUnit
+     2. 按当前选中的滤波方法算出 filtered
+     3. 再把 filtered 回填到 SpeedFilterSensorM1.hAvrMecSpeedUnit
+     4. 这样速度环真正看到的就是“滤波后的速度”
+
+     也正因为这里改的是速度环入口，所以滤波不只是影响画图，
+     它会真实影响启动过程、稳态波动、加减速跟踪这些闭环表现。 */
+
+  /* 把“原始估计速度”单独记下来。
+     这个量后面会用于：
+     1. 串口导出 raw_speed_rpm
+     2. 启动切换保护里检查是否出现反向毛刺
+     3. 和滤波后速度做对比分析 */
   g_mcRawMecSpeedUnit = rawSpeedUnit;
 
+  /* 下面这个 switch 就是“滤波入口”的核心。
+     原版这里没有 switch，也没有多种方法可选；
+     现在是把同一份 rawSpeedUnit 送进不同滤波器，最后统一产出 filtered。 */
   switch (g_mcSpeedFilterMode)
   {
     case MC_SPEED_FILTER_NONE:
+      /* NONE 就是不滤波，等价于“尽量接近原版入口”。
+         这里直接把原始估计速度透传给速度环，用来做对照组。 */
       filtered = rawSpeedUnit;
       break;
 
     case MC_SPEED_FILTER_MOVING_AVG:
       /* 普通滑动平均：窗口更长，抖动更小，但动态会更慢 */
+      /* 先把即将被覆盖掉的旧样本从和里面减掉。 */
       g_mcMovingAvgSum -= g_mcMovingAvgBuffer[g_mcMovingAvgIndex];
+      /* 当前新样本写到环形缓冲区当前位置。 */
       g_mcMovingAvgBuffer[g_mcMovingAvgIndex] = rawSpeedUnit;
+      /* 再把新样本加回总和。 */
       g_mcMovingAvgSum += rawSpeedUnit;
+      /* 指针往后挪，准备下次覆盖下一个旧样本。 */
       g_mcMovingAvgIndex++;
       if (g_mcMovingAvgIndex >= MC_SPEED_FILTER_MOVAVG_DEPTH)
       {
+        /* 到尾部了就从头开始，形成环形队列。 */
         g_mcMovingAvgIndex = 0U;
       }
+      /* 总和除以窗口长度，得到当前平均值。 */
       filtered = g_mcMovingAvgSum / (int32_t)MC_SPEED_FILTER_MOVAVG_DEPTH;
       break;
 
@@ -1532,23 +1563,33 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
       int32_t weightTotal = 0;
 
       /* 加权滑动平均：越新的点权重越大，尽量兼顾平滑和响应 */
+      /* 先把这次的新样本塞进环形缓冲区。 */
       g_mcWeightedMovingAvgBuffer[g_mcWeightedMovingAvgIndex] = rawSpeedUnit;
+      /* 写完后索引向后移。 */
       g_mcWeightedMovingAvgIndex++;
       if (g_mcWeightedMovingAvgIndex >= MC_SPEED_FILTER_WMA_DEPTH)
       {
+        /* 到末尾后回卷，继续复用这块缓冲区。 */
         g_mcWeightedMovingAvgIndex = 0U;
       }
 
+      /* 这里重新遍历整个窗口，给每个样本乘不同权重。
+         sampleCount 越大，权重 (sampleCount + 1) 越大，也就代表“越新的样本更重要”。 */
       for (sampleCount = 0U; sampleCount < MC_SPEED_FILTER_WMA_DEPTH; sampleCount++)
       {
+        /* offset 用来从“最新样本往前倒着找”。 */
         offset = (uint8_t)(MC_SPEED_FILTER_WMA_DEPTH - 1U - sampleCount);
+        /* idx 是当前要取的那个历史样本下标。 */
         idx = (uint8_t)((g_mcWeightedMovingAvgIndex + offset) % MC_SPEED_FILTER_WMA_DEPTH);
+        /* 把该样本乘上对应权重后累加。 */
         weightedSum += (int32_t)g_mcWeightedMovingAvgBuffer[idx] * (int32_t)(sampleCount + 1U);
+        /* 同时统计总权重，后面用于归一化。 */
         weightTotal += (int32_t)(sampleCount + 1U);
       }
 
       if (weightTotal > 0)
       {
+        /* 权重和不为 0 时，算出最后的加权平均结果。 */
         filtered = weightedSum / weightTotal;
       }
       break;
@@ -1560,10 +1601,19 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
       int16_t absSpeedErrorRpm = (speedErrorRpm >= 0) ? speedErrorRpm : (int16_t)(-speedErrorRpm);
       uint8_t activeShift = g_mcAdaptiveCurrentShift;
 
+      /* 先解释这个方法和原版的区别：
+         原版没有“按工况切滤波强度”这件事，一旦选了某种滤波参数就一直不变。
+         现版 ADA-LPF 的思路是：
+         - 启动/大扰动阶段：少滤一些，优先保证响应
+         - 稳态阶段：多滤一些，优先压抖动
+         判断依据就是目标速度与原始估计速度之间的误差大小。 */
+
       if (absSpeedErrorRpm >= g_mcAdaptiveExitRpm)
       {
         /* 扰动一旦变大，立刻回到响应更快的弱滤波 */
+        /* 清掉稳态计数，因为现在已经不算稳态了。 */
         g_mcAdaptiveSteadyCounter = 0U;
+        /* activeShift 取较小值，意味着低通更弱、跟踪更快。 */
         activeShift = g_mcAdaptiveFastShift;
       }
       else if (absSpeedErrorRpm <= g_mcAdaptiveEnterRpm)
@@ -1571,10 +1621,12 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
         /* 进入稳态不能只看一个点，连续满足一段时间再切强滤波 */
         if (g_mcAdaptiveSteadyCounter < g_mcAdaptiveConfirmN)
         {
+          /* 连续满足“小误差”条件时，稳态计数逐步增加。 */
           g_mcAdaptiveSteadyCounter++;
         }
         if (g_mcAdaptiveSteadyCounter >= g_mcAdaptiveConfirmN)
         {
+          /* 连续确认足够多拍以后，才真正切到强滤波。 */
           activeShift = g_mcAdaptiveSlowShift;
         }
       }
@@ -1584,8 +1636,13 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
       }
 
       /* 启动和大扰动阶段少滤一点，稳速以后再加大滤波力度 */
+      /* 把这次决定出来的 shift 保存下来，供下次继续沿用。 */
       g_mcAdaptiveCurrentShift = activeShift;
+      /* 低通滤波的“基底”用的是上一次已经输出给速度环的滤波值。 */
       filtered = (int32_t)g_mcFilteredMecSpeedUnit;
+      /* 这是标准一阶低通写法：
+         新输出 = 旧输出 + (当前输入 - 旧输出) >> shift
+         shift 越大，每次追输入追得越慢，也就是滤波越强。 */
       filtered += ((int32_t)rawSpeedUnit - filtered) >> activeShift;
       break;
     }
@@ -1593,14 +1650,25 @@ static void MC_SPEED_FilterUpdateMecSpeed(const SpeednPosFdbk_Handle_t *pSource,
     case MC_SPEED_FILTER_LPF1:
     default:
       /* 一阶低通是最基础的版本，shift 越大，滤波越强，滞后也越明显 */
+      /* 原版如果我们不插这层，其实连这一步都没有；
+         这里等于是把最简单的一阶低通作为一个可切换实验项加进来。 */
       filtered = (int32_t)g_mcFilteredMecSpeedUnit;
+      /* 仍然是标准一阶离散低通更新式。 */
       filtered += ((int32_t)rawSpeedUnit - filtered) >> g_mcSpeedFilterLpfShift;
       break;
   }
 
+  /* 到这里，filtered 已经是当前模式下最终决定送给速度环的速度值。 */
   g_mcFilteredMecSpeedUnit = (int16_t)filtered;
 
+  /* 这一句非常关键：
+     SpeedFilterSensorM1 是我们真正交给 STC/速度环的速度传感器句柄，
+     所以把滤波结果写到这里，就等于把“速度环入口”从原版的原始估计值
+     改成了“我们处理后的值”。 */
   SpeedFilterSensorM1.hAvrMecSpeedUnit = g_mcFilteredMecSpeedUnit;
+  /* 下面这些不是滤波本身，但要一起同步过去。
+     原因是我们只是想替换“平均机械速度”这一条链路，
+     其它错误计数、加速度等附属信息仍然沿用原始估计器的输出。 */
   SpeedFilterSensorM1.bSpeedErrorNumber = pSource->bSpeedErrorNumber;
   SpeedFilterSensorM1.hMecAccelUnitP = pSource->hMecAccelUnitP;
 }
@@ -2407,10 +2475,18 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   int16_t rawSpeedRpm;
   uint32_t nowTick;
 
-  /* 这就是启动切换保护的核心判断。
-     不是单纯“能闭环了”就接管，而是再确认一下速度真的稳定没。 */
+  /* 先说明原版逻辑：
+     原版 MCSDK 在启动接管这一步，基本就是“状态允许切就切”，
+     对低速阶段的估计毛刺、瞬时反向、刚过门限就立刻切换这些情况没有我们现在这层额外约束。
+
+     现版逻辑：
+     我们没有改 STO+PLL 本体，而是在“是否允许正式切换到闭环估计速度”这个门口又加了一层保护。
+     这层保护的目的就是：宁可晚一点切，也不要在低速估计还不稳的时候硬切过去。 */
+
   if (loopClosed == 0U)
   {
+    /* loopClosed == 0 说明当前连“可切换的大前提”都还没满足。
+       这种时候必须把我们自己的两个保护计数器也一起清零，重新等待下一轮机会。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
     return 0U;
@@ -2419,53 +2495,68 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   /* 保护关掉时就直接放行，方便做基线对比。 */
   if (g_mcStartupProtectEnable == 0U)
   {
+    /* 这里直接 return 1U，等价于“回到更接近原版的切换行为”。 */
     return 1U;
   }
 
-  /* 先看滤波后的速度是不是已经过门限。 */
+  /* 第一道保护：先看滤波后的速度是不是已经过最低可信门限。
+     也就是说，不是只要有速度值就信，而是要先脱离最敏感、最容易乱跳的低速区。 */
   filteredSpeedRpm = MC_SPEED_GetFilteredSpeedRpm();
   if (filteredSpeedRpm < MC_STARTUP_SWITCH_MIN_SPEED_RPM)
   {
+    /* 只要速度重新掉回门限以下，就把“稳定时间”和“连续确认次数”都清零。
+       因为这说明刚才那段稳定判断已经不成立了，必须重新累计。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
     return 0U;
   }
 
-  /* 再看原始速度有没有明显反向。
-     这一步是为了专门压低速时那种“看起来突然倒一下”的毛刺。 */
+  /* 第二道保护：再看原始估计速度有没有明显反向。
+     注意这里故意看的是 raw，不是 filtered。
+     原因是反向毛刺本来就是瞬时尖刺，如果只看滤波后的值，反而可能把尖刺掩掉。 */
   rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
   if (rawSpeedRpm < 0)
   {
+    /* 只要检测到反向，就认为估计还不够稳，整套确认过程重新开始。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
     return 0U;
   }
 
-  /* 连续确认几拍，别因为一拍正常就立刻放行。 */
+  /* 第三道保护：连续确认若干拍。
+     目的就是避免“刚好这一拍正常”就误以为已经稳定。 */
   if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
   {
+    /* 每多一拍满足条件，就把确认计数 +1。 */
     g_mcStartupEstimateConfirmCounter++;
   }
 
   if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
   {
+    /* 只要连续拍数还不够，就继续等，不允许切换。 */
     return 0U;
   }
 
+  /* 到这里说明：速度门限满足了，反向尖刺没出现，而且已经连续好多拍都正常。 */
   nowTick = HAL_GetTick();
   /* 真正开始计稳定时长。 */
   if (g_mcStartupSwitchStableTick == 0U)
   {
+    /* 第一次进入“连续拍数够了”的状态时，只记录起始时刻，不马上放行。 */
     g_mcStartupSwitchStableTick = nowTick;
     return 0U;
   }
 
-  /* 稳定时长还没到，就继续等。 */
+  /* 第四道保护：再补一个稳定时长门槛。
+     也就是说，即便连续几拍正常，也还要再维持一小段时间，才允许切换。 */
   if ((nowTick - g_mcStartupSwitchStableTick) < (uint32_t)MC_STARTUP_SWITCH_STABLE_MS)
   {
+    /* 还没稳定够这么多毫秒，就继续挡住。 */
     return 0U;
   }
 
+  /* 四层条件全部通过后，才真正返回 1U。
+     外层代码拿到这个 1U，才会认为“现在切换过去比较安全”。 */
   return 1U;
 }
 

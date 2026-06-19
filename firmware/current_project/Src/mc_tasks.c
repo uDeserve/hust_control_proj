@@ -67,16 +67,31 @@ extern UART_HandleTypeDef huart2;
 #define MC_EXPERIMENT_STOP_CAPTURE_MS        ((uint16_t)1200)
 #define MC_EXPERIMENT_STOP_SETTLE_MS         ((uint16_t)2200)
 #define MC_EXPERIMENT_TOTAL_RUN_MS           ((uint16_t)18000)
-#define MC_EXPERIMENT_START_TIMEOUT_MS       ((uint16_t)2500)
+#define MC_EXPERIMENT_START_TIMEOUT_MS       ((uint16_t)6000)
 #define MC_EXPERIMENT_INTER_SESSION_WAIT_MS  ((uint16_t)1000)
 
 /* 启动切换保护的三个核心门限。
    这几个值不是“玄学参数”，而是我们后面实验里专门用来压低速毛刺和切换顿挫的。 */
-#define MC_STARTUP_SWITCH_MIN_SPEED_RPM      ((int16_t)120)
-#define MC_STARTUP_SWITCH_STABLE_MS          ((uint16_t)120)
-#define MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES  ((uint16_t)5)
+#define MC_STARTUP_SWITCH_MIN_SPEED_RPM      ((int16_t)40)
+#define MC_STARTUP_SWITCH_STABLE_MS          ((uint16_t)20)
+#define MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES  ((uint16_t)2)
+/* 保护最长等待时间。
+   如果前面条件一直卡着不满足，就别让它无限拖下去，避免撞上 rev-up 超时。 */
+#define MC_STARTUP_SWITCH_TIMEOUT_MS         ((uint16_t)5000)
+/* 只有出现“明显反向”才拦截；低速阶段个位数抖动不再一票否决。 */
+#define MC_STARTUP_RAW_REVERSE_BLOCK_RPM     ((int16_t)30)
+/* 进入 SWITCH_OVER 以后，保护门最多只额外占用这么久。
+   目的不是放弃保护，而是避免保护门本身把 rev-up 时序拖超时。 */
+#define MC_STARTUP_SWITCH_MAX_HOLD_MS        ((uint16_t)60)
 
-#define MC_EXPERIMENT_TX_BUFFER_SIZE         256U
+#define MC_STARTUP_BLOCK_NONE                0U
+#define MC_STARTUP_BLOCK_LOOP_OPEN           1U
+#define MC_STARTUP_BLOCK_FILTERED_LOW        2U
+#define MC_STARTUP_BLOCK_RAW_NEGATIVE        3U
+#define MC_STARTUP_BLOCK_CONFIRMING          4U
+#define MC_STARTUP_BLOCK_STABILIZING         5U
+
+#define MC_EXPERIMENT_TX_BUFFER_SIZE         512U
 #define MC_EXPERIMENT_QUEUE_DEPTH           96U
 #define MC_EXPERIMENT_METHOD_NAME_LEN       20U
 #define MC_EXPERIMENT_PARAM_NAME_LEN        40U
@@ -196,6 +211,13 @@ typedef struct
   int16_t pllKi;
   uint8_t pllStage;
   uint8_t pllSplitEnable;
+  uint8_t motorState;
+  uint8_t loopClosed;
+  uint8_t observerConverged;
+  uint8_t switchReady;
+  uint8_t switchBlockReason;
+  uint8_t switchConfirmCount;
+  uint16_t switchStableElapsedMs;
   uint8_t phase;
   uint8_t stopReason;
   char methodName[MC_EXPERIMENT_METHOD_NAME_LEN];
@@ -256,6 +278,15 @@ static uint8_t g_mcStartupProtectEnable = 1U;
    一个记“稳定了多久”，一个记“连续确认了几拍”。 */
 static uint32_t g_mcStartupSwitchStableTick = 0U;
 static uint16_t g_mcStartupEstimateConfirmCounter = 0U;
+static uint32_t g_mcStartupSwitchEnterTick = 0U;
+static uint8_t g_mcStartupLoopClosedLatched = 0U;
+/* 下面这一组是启动链路诊断状态。
+   目的不是长期保留一堆调试变量，而是先把“到底卡在哪”查死。 */
+static uint8_t g_mcStartupDbgLoopClosed = 0U;
+static uint8_t g_mcStartupDbgObserverConverged = 0U;
+static uint8_t g_mcStartupDbgSwitchReady = 0U;
+static uint8_t g_mcStartupDbgSwitchBlockReason = 0U;
+static uint8_t g_mcStartupDbgMotorState = 0U;
 
 static uint8_t g_mcExperimentConfigIndex = 0U;
 static uint16_t g_mcExperimentSessionId = 0U;
@@ -836,6 +867,7 @@ __weak void TSK_MediumFrequencyTaskM1(void)
 
         case START:
         {
+          g_mcStartupDbgMotorState = (uint8_t)START;
           if (MCI_STOP == Mci[M1].DirectCommand)
           {
             TSK_MF_StopProcessing(&Mci[M1], M1);
@@ -872,6 +904,7 @@ __weak void TSK_MediumFrequencyTaskM1(void)
 
             {
              ObserverConverged = STO_PLL_IsObserverConverged(&STO_PLL_M1, &hForcedMecSpeedUnit);
+             g_mcStartupDbgObserverConverged = (uint8_t)((ObserverConverged == true) ? 1U : 0U);
              STO_SetDirection(&STO_PLL_M1, (int8_t)MCI_GetImposedMotorDirection(&Mci[M1]));
 
               (void)VSS_SetStartTransition(&VirtualSpeedSensorM1, ObserverConverged);
@@ -894,6 +927,11 @@ __weak void TSK_MediumFrequencyTaskM1(void)
 
         case SWITCH_OVER:
         {
+          g_mcStartupDbgMotorState = (uint8_t)SWITCH_OVER;
+          if (g_mcStartupSwitchEnterTick == 0U)
+          {
+            g_mcStartupSwitchEnterTick = HAL_GetTick();
+          }
           if (MCI_STOP == Mci[M1].DirectCommand)
           {
             TSK_MF_StopProcessing(&Mci[M1], M1);
@@ -921,13 +959,19 @@ __weak void TSK_MediumFrequencyTaskM1(void)
               bool tempBool;
               tempBool = VSS_TransitionEnded(&VirtualSpeedSensorM1);
               LoopClosed = LoopClosed || tempBool;
+              if (true == LoopClosed)
+              {
+                g_mcStartupLoopClosedLatched = 1U;
+              }
+              g_mcStartupDbgLoopClosed = g_mcStartupLoopClosedLatched;
 
               /* 原版这里基本上是“看起来能闭环了就切过去”。
                  我们这里多包一层判断：
                  1. 如果演示的是无保护基线，就直接放行；
                  2. 如果开了保护，就要求速度先过最小门限，并且连续稳定一小段时间。
                  这么做主要是为了把低速毛刺和切换顿挫压下去。 */
-              SwitchReady = MC_STARTUP_IsSwitchReady((uint8_t)((true == LoopClosed) ? 1U : 0U));
+              SwitchReady = MC_STARTUP_IsSwitchReady(g_mcStartupLoopClosedLatched);
+              g_mcStartupDbgSwitchReady = SwitchReady;
 
               if (SwitchReady != 0U)
               {
@@ -950,6 +994,7 @@ __weak void TSK_MediumFrequencyTaskM1(void)
                 FOC_CalcCurrRef( M1 );
                 STC_ForceSpeedReferenceToCurrentSpeed(pSTC[M1]); /* Init the reference speed to current speed */
                 MCI_ExecBufferedCommands(&Mci[M1]); /* Exec the speed ramp after changing of the speed sensor */
+                g_mcStartupDbgMotorState = (uint8_t)RUN;
                 Mci[M1].State = RUN;
               }
             }
@@ -1810,6 +1855,13 @@ static void MC_EXPERIMENT_ApplyConfig(const MC_ExperimentConfig_t *pConfig)
   /* 每轮重新开始前，把保护逻辑的小状态清掉，不然上一轮的稳定计数会串到下一轮。 */
   g_mcStartupSwitchStableTick = 0U;
   g_mcStartupEstimateConfirmCounter = 0U;
+  g_mcStartupSwitchEnterTick = 0U;
+  g_mcStartupLoopClosedLatched = 0U;
+  g_mcStartupDbgLoopClosed = 0U;
+  g_mcStartupDbgObserverConverged = 0U;
+  g_mcStartupDbgSwitchReady = 0U;
+  g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_NONE;
+  g_mcStartupDbgMotorState = (uint8_t)MC_GetSTMStateMotor1();
   MC_PLL_TuningApply(pConfig);
 }
 
@@ -1922,6 +1974,16 @@ static void MC_EXPERIMENT_PushSample(uint8_t phase, uint8_t stopReason)
   sample.pllKi = g_mcPllActiveKi;
   sample.pllStage = g_mcPllCurrentStage;
   sample.pllSplitEnable = g_mcPllSplitEnable;
+  sample.motorState = g_mcStartupDbgMotorState;
+  sample.loopClosed = g_mcStartupDbgLoopClosed;
+  sample.observerConverged = g_mcStartupDbgObserverConverged;
+  sample.switchReady = g_mcStartupDbgSwitchReady;
+  sample.switchBlockReason = g_mcStartupDbgSwitchBlockReason;
+  sample.switchConfirmCount = (uint8_t)g_mcStartupEstimateConfirmCounter;
+  if (g_mcStartupSwitchStableTick != 0U)
+  {
+    sample.switchStableElapsedMs = (uint16_t)(HAL_GetTick() - g_mcStartupSwitchStableTick);
+  }
   sample.phase = phase;
   sample.stopReason = stopReason;
   (void)snprintf(sample.methodName, sizeof(sample.methodName), "%s", pConfig->methodName);
@@ -1951,6 +2013,16 @@ static void MC_EXPERIMENT_PushMetaFrame(uint8_t phase, uint8_t stopReason)
   sample.pllKi = g_mcPllActiveKi;
   sample.pllStage = g_mcPllCurrentStage;
   sample.pllSplitEnable = g_mcPllSplitEnable;
+  sample.motorState = g_mcStartupDbgMotorState;
+  sample.loopClosed = g_mcStartupDbgLoopClosed;
+  sample.observerConverged = g_mcStartupDbgObserverConverged;
+  sample.switchReady = g_mcStartupDbgSwitchReady;
+  sample.switchBlockReason = g_mcStartupDbgSwitchBlockReason;
+  sample.switchConfirmCount = (uint8_t)g_mcStartupEstimateConfirmCounter;
+  if (g_mcStartupSwitchStableTick != 0U)
+  {
+    sample.switchStableElapsedMs = (uint16_t)(HAL_GetTick() - g_mcStartupSwitchStableTick);
+  }
   sample.phase = phase;
   sample.stopReason = stopReason;
   (void)snprintf(sample.methodName, sizeof(sample.methodName), "%s", pConfig->methodName);
@@ -2017,9 +2089,9 @@ static void MC_EXPERIMENT_SendTextIfPossible(void)
   {
     int length = snprintf(g_mcExperimentTxBuffer,
                           sizeof(g_mcExperimentTxBuffer),
-                          "time_ms,target_speed_rpm,raw_speed_rpm,filtered_speed_rpm,final_speed_rpm,pll_kp,pll_ki,pll_stage,pll_split_enable,session_id,config_index,method_name,param_tag,phase,stop_reason,sample_index\r\n");
+                          "time_ms,target_speed_rpm,raw_speed_rpm,filtered_speed_rpm,final_speed_rpm,pll_kp,pll_ki,pll_stage,pll_split_enable,motor_state,loop_closed,observer_converged,switch_ready,switch_block_reason,switch_confirm_count,switch_stable_elapsed_ms,session_id,config_index,method_name,param_tag,phase,stop_reason,sample_index\r\n");
     g_mcExperimentHeaderPending = 0U;
-    if (length > 0)
+    if ((length > 0) && ((uint16_t)length < (uint16_t)sizeof(g_mcExperimentTxBuffer)))
     {
       (void)HAL_UART_Transmit(&huart2, (uint8_t *)g_mcExperimentTxBuffer, (uint16_t)length, 100U);
     }
@@ -2032,7 +2104,13 @@ static void MC_EXPERIMENT_SendTextIfPossible(void)
   }
 
   MC_EXPERIMENT_FormatCsvLine(&sample, g_mcExperimentTxBuffer, sizeof(g_mcExperimentTxBuffer));
-  (void)HAL_UART_Transmit(&huart2, (uint8_t *)g_mcExperimentTxBuffer, (uint16_t)strlen(g_mcExperimentTxBuffer), 100U);
+  {
+    size_t lineLen = strlen(g_mcExperimentTxBuffer);
+    if (lineLen < sizeof(g_mcExperimentTxBuffer))
+    {
+      (void)HAL_UART_Transmit(&huart2, (uint8_t *)g_mcExperimentTxBuffer, (uint16_t)lineLen, 100U);
+    }
+  }
 }
 
 static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, char *pBuffer, uint16_t bufferSize)
@@ -2045,7 +2123,7 @@ static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, ch
 
   (void)snprintf(pBuffer,
                  bufferSize,
-                 "%lu,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%s,%s,%s,%s,%lu\r\n",
+                 "%lu,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%s,%s,%s,%s,%lu\r\n",
                  (unsigned long)pSample->timeMs,
                  pSample->targetSpeedRpm,
                  pSample->rawSpeedRpm,
@@ -2055,6 +2133,13 @@ static void MC_EXPERIMENT_FormatCsvLine(const MC_ExperimentSample_t *pSample, ch
                  pSample->pllKi,
                  pSample->pllStage,
                  pSample->pllSplitEnable,
+                 pSample->motorState,
+                 pSample->loopClosed,
+                 pSample->observerConverged,
+                 pSample->switchReady,
+                 pSample->switchBlockReason,
+                 pSample->switchConfirmCount,
+                 pSample->switchStableElapsedMs,
                  pSample->sessionId,
                  pSample->configIndex,
                  pSample->methodName,
@@ -2230,7 +2315,11 @@ static void MC_EXPERIMENT_AbortStartIfNeeded(MCI_State_t motorState)
     return;
   }
 
-  if (motorState == RUN)
+  /* 只要电机已经进入 START / SWITCH_OVER / RUN，这一轮就还在“正常启动链路”里，
+     不要让实验层自己提前判死。真正的启动失败交给底层 MCSDK 的状态机去报错。 */
+  if ((motorState == START) ||
+      (motorState == SWITCH_OVER) ||
+      (motorState == RUN))
   {
     return;
   }
@@ -2474,6 +2563,7 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   int16_t filteredSpeedRpm;
   int16_t rawSpeedRpm;
   uint32_t nowTick;
+  uint32_t switchHoldMs = 0U;
 
   /* 先说明原版逻辑：
      原版 MCSDK 在启动接管这一步，基本就是“状态允许切就切”，
@@ -2489,6 +2579,7 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
        这种时候必须把我们自己的两个保护计数器也一起清零，重新等待下一轮机会。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_LOOP_OPEN;
     return 0U;
   }
 
@@ -2496,7 +2587,14 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   if (g_mcStartupProtectEnable == 0U)
   {
     /* 这里直接 return 1U，等价于“回到更接近原版的切换行为”。 */
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_NONE;
     return 1U;
+  }
+
+  nowTick = HAL_GetTick();
+  if (g_mcStartupSwitchEnterTick != 0U)
+  {
+    switchHoldMs = nowTick - g_mcStartupSwitchEnterTick;
   }
 
   /* 第一道保护：先看滤波后的速度是不是已经过最低可信门限。
@@ -2508,6 +2606,7 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
        因为这说明刚才那段稳定判断已经不成立了，必须重新累计。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_FILTERED_LOW;
     return 0U;
   }
 
@@ -2515,11 +2614,12 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
      注意这里故意看的是 raw，不是 filtered。
      原因是反向毛刺本来就是瞬时尖刺，如果只看滤波后的值，反而可能把尖刺掩掉。 */
   rawSpeedRpm = MC_SPEED_GetRawSpeedRpm();
-  if (rawSpeedRpm < 0)
+  if (rawSpeedRpm <= (-MC_STARTUP_RAW_REVERSE_BLOCK_RPM))
   {
     /* 只要检测到反向，就认为估计还不够稳，整套确认过程重新开始。 */
     g_mcStartupSwitchStableTick = 0U;
     g_mcStartupEstimateConfirmCounter = 0U;
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_RAW_NEGATIVE;
     return 0U;
   }
 
@@ -2534,16 +2634,17 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
   if (g_mcStartupEstimateConfirmCounter < MC_STARTUP_ESTIMATE_CONFIRM_SAMPLES)
   {
     /* 只要连续拍数还不够，就继续等，不允许切换。 */
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_CONFIRMING;
     return 0U;
   }
 
   /* 到这里说明：速度门限满足了，反向尖刺没出现，而且已经连续好多拍都正常。 */
-  nowTick = HAL_GetTick();
   /* 真正开始计稳定时长。 */
   if (g_mcStartupSwitchStableTick == 0U)
   {
     /* 第一次进入“连续拍数够了”的状态时，只记录起始时刻，不马上放行。 */
     g_mcStartupSwitchStableTick = nowTick;
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_STABILIZING;
     return 0U;
   }
 
@@ -2551,12 +2652,23 @@ static uint8_t MC_STARTUP_IsSwitchReady(uint8_t loopClosed)
      也就是说，即便连续几拍正常，也还要再维持一小段时间，才允许切换。 */
   if ((nowTick - g_mcStartupSwitchStableTick) < (uint32_t)MC_STARTUP_SWITCH_STABLE_MS)
   {
+    /* 兜底逻辑：
+       保护门最多只在 SWITCH_OVER 里额外占一个很短的窗口，
+       超过这个窗口就必须放行，避免把 rev-up 时序直接拖成启动故障。 */
+    if (switchHoldMs >= (uint32_t)MC_STARTUP_SWITCH_MAX_HOLD_MS)
+    {
+      g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_NONE;
+      return 1U;
+    }
+
     /* 还没稳定够这么多毫秒，就继续挡住。 */
+    g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_STABILIZING;
     return 0U;
   }
 
   /* 四层条件全部通过后，才真正返回 1U。
      外层代码拿到这个 1U，才会认为“现在切换过去比较安全”。 */
+  g_mcStartupDbgSwitchBlockReason = MC_STARTUP_BLOCK_NONE;
   return 1U;
 }
 
